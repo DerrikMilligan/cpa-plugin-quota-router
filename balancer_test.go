@@ -489,3 +489,14 @@ func TestOnDemandRefreshDoesNotHammerAnUnreadableAccount(t *testing.T) {
 		t.Fatalf("calls = %d after the gap, want 2", calls)
 	}
 }
+
+// The host HTML-escapes plugin metadata before the Management Center shows
+// it, and the panel prints the entities literally, so these characters would
+// render as &#34; and friends.
+func TestConfigFieldDescriptionsSurviveHTMLEscaping(t *testing.T) {
+	for _, field := range pluginRegistration().Metadata.ConfigFields {
+		if strings.ContainsAny(field.Description, `"'<>&`) {
+			t.Errorf("%s description contains an HTML-escaped character: %s", field.Name, field.Description)
+		}
+	}
+}

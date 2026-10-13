@@ -53,8 +53,9 @@ plugins:
       five-hour-ceiling: 90      # percent used
       weekly-ceiling: 90         # percent used
       accounts:                  # per-account ceilings, keyed by email or auth file name
-        someone@example.com:
-          five-hour-ceiling: 60  # unset fields inherit the defaults
+        example@example.com:     # matches no account; a template to copy
+          five-hour-ceiling: 90  # unset fields inherit the defaults
+          weekly-ceiling: 90
       spread-band: 10            # headroom points treated as a tie
       rebalance-margin: 25       # headroom gap that moves a live conversation
       affinity-ttl: 1h           # idle time before a conversation binding expires
@@ -62,6 +63,20 @@ plugins:
       max-staleness: 10m         # older readings make an account ineligible (>= 2x poll-interval)
       request-timeout: 10s
 ```
+
+In the Management Center the `accounts` field is a JSON box. Copy the template
+entry, change the email, and set the numbers:
+
+```json
+{
+  "example@example.com": { "five-hour-ceiling": 90, "weekly-ceiling": 90 },
+  "someone@example.com": { "five-hour-ceiling": 70, "weekly-ceiling": 80 }
+}
+```
+
+Saving applies live. Field descriptions avoid quotes, apostrophes, `<`, `>`
+and `&`: the host HTML-escapes plugin metadata and the panel shows the
+entities literally.
 
 Status: `GET /v0/management/plugins/quota-balancer/status` (management key)
 lists each account's usage, ceilings, headroom, eligibility and live
