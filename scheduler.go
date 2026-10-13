@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -72,16 +73,17 @@ type accountView struct {
 	FiveHour float64 `json:"five_hour_used"`
 	Weekly   float64 `json:"weekly_used"`
 	// Headroom is the smaller of the two windows' points left under the ceiling.
-	Headroom        float64 `json:"headroom"`
-	Eligible        bool    `json:"eligible"`
-	Reason          string  `json:"reason,omitempty"`
-	LiveSessions    int     `json:"live_sessions"`
-	FiveHourResetAt string  `json:"five_hour_reset_at,omitempty"`
-	WeeklyResetAt   string  `json:"weekly_reset_at,omitempty"`
-	SeenAt          string  `json:"seen_at,omitempty"`
-	LastError       string  `json:"last_error,omitempty"`
-	BackoffUntil    string  `json:"backoff_until,omitempty"`
-	HostStatus      string  `json:"host_status,omitempty"`
+	Headroom        float64     `json:"headroom"`
+	Eligible        bool        `json:"eligible"`
+	Reason          string      `json:"reason,omitempty"`
+	LiveSessions    int         `json:"live_sessions"`
+	FiveHourResetAt string      `json:"five_hour_reset_at,omitempty"`
+	WeeklyResetAt   string      `json:"weekly_reset_at,omitempty"`
+	SeenAt          string      `json:"seen_at,omitempty"`
+	LastError       string      `json:"last_error,omitempty"`
+	BackoffUntil    string      `json:"backoff_until,omitempty"`
+	HostStatus      string      `json:"host_status,omitempty"`
+	Resets          *grantsView `json:"resets,omitempty"`
 }
 
 func evaluate(authID string, sample quotaSample, cfg pluginConfig, now time.Time) accountView {
@@ -100,6 +102,7 @@ func evaluate(authID string, sample quotaSample, cfg pluginConfig, now time.Time
 	if now.Before(sample.BackoffUntil) {
 		view.BackoffUntil = formatTime(sample.BackoffUntil)
 	}
+	view.Resets = sample.Grants.view(now)
 	if !sample.HasSample {
 		view.Reason = "no usage reading yet"
 		return view
@@ -365,6 +368,14 @@ func (r *pluginRuntime) handleManagement(req pluginapi.ManagementRequest) plugin
 			},
 			Body: uiPage,
 		}
+	case strings.EqualFold(strings.TrimSpace(req.Method), http.MethodPost) && strings.HasSuffix(path, managementResetRoute):
+		var body resetRequest
+		if json.Unmarshal(req.Body, &body) != nil {
+			raw, _ := json.Marshal(map[string]string{"error": "invalid body"})
+			return pluginapi.ManagementResponse{StatusCode: http.StatusBadRequest, Headers: jsonHeaders(), Body: raw}
+		}
+		raw, _ := json.Marshal(r.useReset(context.Background(), body))
+		return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: jsonHeaders(), Body: raw}
 	case get && strings.HasSuffix(path, managementStatusRoute):
 		body, _ := json.Marshal(r.status())
 		return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: jsonHeaders(), Body: body}

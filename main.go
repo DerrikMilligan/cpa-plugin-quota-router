@@ -16,12 +16,15 @@ const (
 	minimumPollInterval        = 30 * time.Second
 	maxRateLimitBackoff        = 15 * time.Minute
 	usageReadSpacing           = 5 * time.Second
-	defaultUsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
+	defaultUsageEndpoint       = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
+	claudeCLIUserAgent         = "claude-cli/2.1.280 (external, cli)"
+	resetClaimTimeout          = 25 * time.Second
 	anthropicOAuthBeta         = "oauth-2025-04-20"
 	maxUsageResponseBytes      = 64 << 10
 	exhaustedErrorCode         = "quota_balancer_exhausted"
 	managementStatusRoute      = "/plugins/quota-balancer/status"
 	managementStatusFullPath   = "/v0/management" + managementStatusRoute
+	managementResetRoute       = "/plugins/quota-balancer/reset"
 	uiResourcePath             = "/v0/resource/plugins/" + pluginName + "/ui"
 	pollErrorAuthList          = "auth_list"
 	pollErrorAuthGet           = "auth_get"
@@ -41,10 +44,13 @@ const (
 	pollErrorRead              = "read_error"
 )
 
-var pluginVersion = "1.4.1"
+var pluginVersion = "1.5.0"
 
-// Variable only so the C-shared integration test can inject a local fixture.
-var usageEndpoint = defaultUsageEndpoint
+// Variables only so tests can inject local fixtures.
+var (
+	usageEndpoint = defaultUsageEndpoint
+	claudeAPIBase = "https://api.anthropic.com"
+)
 
 var activeRuntime = func() *pluginRuntime {
 	r := newPluginRuntime(cgoHostClient{}, newHTTPUsageFetcher(usageEndpoint, nil).fetch, time.Now)

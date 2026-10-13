@@ -92,6 +92,23 @@ Saving applies live. Field descriptions avoid quotes, apostrophes, `<`, `>`
 and `&`: the host HTML-escapes plugin metadata and the panel shows the
 entities literally.
 
+## Usage-limit resets
+
+Anthropic grants some accounts usage-limit resets (for example the Opus 5.5
+launch reset for Enterprise members). The usage read asks for them
+(`?cedar_ember=1`), so they cost no extra calls; every account gets a full
+read at least every 30 minutes and once after a restart to keep them current.
+
+Each card shows resets left, what a reset clears, when it expires, and a
+**Use reset** button when Anthropic marks it usable (some grants only work once
+the account is at its limit; the card says why when not). Using one calls
+`POST /api/organizations/<org>/reset_rate_limits` exactly as
+cpa-usage-keeper does, through the plugin route
+`POST /v0/management/plugins/quota-balancer/reset` (`{"account": "<email or
+auth id>", "grant_id": "<id>"}`). It is never retried: a dropped connection
+may have been applied, so an unknown outcome is reported as such. On success
+the cleared windows read 0 at once and a confirming read is queued.
+
 ## Management Center page
 
 The plugin adds a **Quota Balancer** entry to the Management Center sidebar.

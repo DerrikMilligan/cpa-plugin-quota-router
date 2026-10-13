@@ -59,6 +59,12 @@
   .ceil { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--text); opacity: .75; border-radius: 1px; }
   .window .foot { display: flex; justify-content: space-between; margin-top: 3px; }
   .reason { font-size: 13px; color: var(--pill-bad-text); }
+  .resets { border: 1px dashed var(--line); border-radius: 8px; padding: 8px 10px; display: flex;
+            align-items: center; gap: 10px; }
+  .resets .what { flex: 1; min-width: 0; }
+  .resets .title { font-size: 13px; font-weight: 600; }
+  .resets .grant { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .resets button { white-space: nowrap; flex: none; }
   .bottom { display: flex; justify-content: space-between; align-items: center; gap: 8px;
             border-top: 1px solid var(--line); padding-top: 10px; }
   .edit { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
@@ -111,6 +117,8 @@
   const API = "/v0/management";
   const STATUS = API + "/plugins/" + PLUGIN + "/status";
   const CONFIG = API + "/plugins/" + PLUGIN + "/config";
+  const RESET = API + "/plugins/" + PLUGIN + "/reset";
+  const WINDOW_NAMES = { five_hour: "5-hour", seven_day: "weekly", seven_day_overage_included: "weekly incl. overage" };
   const SESSION_KEY = PLUGIN + "::management-key";
   const REFRESH_MS = 15000;
   let key = "";
@@ -177,6 +185,58 @@
       node.append(child instanceof Node ? child : document.createTextNode(String(child)));
     }
     return node;
+  }
+
+  // The host HTML-escapes strings in plugin management responses.
+  function decode(text) {
+    const area = document.createElement("textarea");
+    area.innerHTML = text == null ? "" : String(text);
+    return area.value;
+  }
+
+  function clearsText(clears) {
+    return (clears || []).map(c => WINDOW_NAMES[c] || decode(c)).join(" + ") || "unknown windows";
+  }
+
+  function resetsBlock(account, id) {
+    const r = account.resets;
+    if (!r) return el("div", { class: "resets" }, el("div", { class: "what sub" }, "Resets: not read yet"));
+    if (!r.eligible) {
+      return el("div", { class: "resets" }, el("div", { class: "what sub" },
+        "Resets: not eligible" + (r.ineligible_reason ? " (" + decode(r.ineligible_reason) + ")" : "")));
+    }
+    const grant = r.grants.find(g => g.id === r.usable_grant_id) || r.grants.find(g => g.resets_left > 0) || r.grants[0];
+    const title = r.available + (r.available === 1 ? " reset left" : " resets left");
+    if (!grant) return el("div", { class: "resets" }, el("div", { class: "what sub" }, "Resets: none available"));
+    const ends = grant.ends_at ? "expires " + new Date(grant.ends_at).toLocaleDateString([], { month: "short", day: "numeric" }) : "";
+    const usable = r.usable_grant_id === grant.id;
+    const button = el("button", { type: "button", class: usable ? "primary" : "", disabled: !usable,
+      title: usable ? "Spend this reset now" : decode(grant.unusable || "not usable now") }, "Use reset");
+    button.addEventListener("click", () => useReset(account, id, grant, r.available, button));
+    return el("div", { class: "resets" },
+      el("div", { class: "what" },
+        el("div", { class: "title" }, title, el("span", { class: "sub" }, " - clears " + clearsText(grant.clears) + (ends ? ", " + ends : ""))),
+        el("div", { class: "grant", title: decode(grant.label) }, usable ? decode(grant.label) : decode(grant.unusable || "") + " - " + decode(grant.label))),
+      button);
+  }
+
+  async function useReset(account, id, grant, available, button) {
+    const message = "Use 1 usage-limit reset on " + id + "?\n\n" + decode(grant.label) +
+      "\nClears: " + clearsText(grant.clears) +
+      "\nResets left after this: " + Math.max(0, available - 1) +
+      "\n\nThis spends the reset with Anthropic and cannot be undone.";
+    if (!confirm(message)) return;
+    button.disabled = true;
+    try {
+      const out = await api("POST", RESET, { account: account.id, grant_id: grant.id });
+      const ok = out.result === "reset" || out.result === "already_used";
+      notice(id + ": " + decode(out.message || out.result), ok ? "info" : "error");
+      editing = false;
+      setTimeout(() => load(true), 1200);
+    } catch (err) {
+      if (err.auth) return askForKey("That key was not accepted.");
+      notice(err.message + ". The outcome is unknown; check this card after the next read before trying again.", "error");
+    }
   }
 
   function notice(text, kind) {
@@ -259,9 +319,10 @@
         el("div", { class: "headroom" },
           el("div", { class: "v" }, known ? Math.max(0, Math.round(account.headroom)) : "-"),
           el("div", { class: "k" }, "headroom"))),
-      account.eligible ? null : el("div", { class: "reason" }, account.reason || ""),
+      account.eligible ? null : el("div", { class: "reason" }, decode(account.reason || "")),
       windowBar("5-hour", account.five_hour_used, account.ceilings.five_hour, account.five_hour_reset_at, known),
       windowBar("Weekly", account.weekly_used, account.ceilings.weekly, account.weekly_reset_at, known),
+      resetsBlock(account, id),
       el("div", { class: "bottom" },
         el("span", { class: "sub" }, read.join(" - ")),
         toggle),
@@ -289,6 +350,7 @@
       document.getElementById("stats").replaceChildren(
         stat(routing + " / " + accounts.length, "accounts routing"),
         stat(live, "live conversations"),
+        stat(accounts.reduce((n, a) => n + (a.resets && a.resets.eligible ? a.resets.available : 0), 0), "resets available"),
         stat(accounts.length ? Math.round(Math.max(...accounts.map(a => a.known ? a.headroom : 0))) : "-", "best headroom"));
       document.getElementById("cards").replaceChildren(...accounts.map(a => card(a, d)));
       document.getElementById("content").hidden = false;

@@ -277,7 +277,10 @@ type managementRoute struct {
 
 func managementRegistration() managementRegistrationResponse {
 	return managementRegistrationResponse{
-		Routes: []managementRoute{{Method: http.MethodGet, Path: managementStatusRoute}},
+		Routes: []managementRoute{
+			{Method: http.MethodGet, Path: managementStatusRoute},
+			{Method: http.MethodPost, Path: managementResetRoute},
+		},
 		Resources: []resourceRoute{{
 			Path:        uiResourcePath,
 			Menu:        "Quota Balancer",

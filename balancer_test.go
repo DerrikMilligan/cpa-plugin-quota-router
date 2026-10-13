@@ -32,7 +32,7 @@ func (h *fakeHost) listAuth() ([]pluginapi.HostAuthFileEntry, error) {
 }
 
 func (h *fakeHost) getAuth(authIndex string) (json.RawMessage, error) {
-	return json.RawMessage(fmt.Sprintf(`{"type":"claude","access_token":"token-%s"}`, authIndex)), nil
+	return json.RawMessage(fmt.Sprintf(`{"type":"claude","access_token":"token-%s","organization_uuid":"%s"}`, authIndex, testOrgUUID)), nil
 }
 
 func (h *fakeHost) log(level, message string, _ map[string]any) {
@@ -685,6 +685,14 @@ func TestHeaderFreshAccountsAreNotPolled(t *testing.T) {
 	if reads.Load() != 1 {
 		t.Fatalf("usage endpoint read %d times for an account refreshed by headers, want 1", reads.Load())
 	}
+	for i := 0; i < 25; i++ { // past fullReadInterval: one full read for its grants
+		c.advance(time.Minute)
+		r.handleUsage(usageRecord{AuthID: authIDFor("a@x.com"), ResponseHeaders: rateHeaders(0.10, 0.12)})
+		r.refreshAll(context.Background())
+	}
+	if reads.Load() != 2 {
+		t.Fatalf("busy account read %d times in 35 minutes, want 2 (one full read per 30m)", reads.Load())
+	}
 }
 
 func TestIdleAccountsArePolledOncePerInterval(t *testing.T) {
@@ -735,16 +743,20 @@ func TestReadingsSurviveARestart(t *testing.T) {
 	second.stateFile = state
 	second.loadState()
 	second.refreshAll(context.Background())
-	if secondReads.Load() != 0 {
-		t.Fatalf("restart re-read a fresh cached reading %d times", secondReads.Load())
+	if secondReads.Load() != 1 {
+		t.Fatalf("restart should read each account once for its grants, read %d times", secondReads.Load())
+	}
+	second.refreshAll(context.Background())
+	if secondReads.Load() != 1 {
+		t.Fatalf("restart re-read a fresh reading again: %d", secondReads.Load())
 	}
 	if got := mustPick(t, second, "", "a@x.com"); got != "a@x.com" {
 		t.Fatalf("restored reading not routable: %s", got)
 	}
 	c.advance(2 * time.Minute)
 	second.refreshAll(context.Background())
-	if secondReads.Load() != 1 {
-		t.Fatalf("stale restored reading was not refreshed: %d", secondReads.Load())
+	if secondReads.Load() != 2 {
+		t.Fatalf("stale reading was not refreshed: %d", secondReads.Load())
 	}
 }
 

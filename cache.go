@@ -25,6 +25,13 @@ type quotaSample struct {
 	// RateLimits counts consecutive 429s to grow the backoff.
 	BackoffUntil time.Time
 	RateLimits   int
+	// Grants are the usage-limit resets from the last read that reported them.
+	Grants *resetGrants
+	// ForceRead asks the worker to read this account on its next pass.
+	ForceRead bool
+	// GrantsChecked is set by this runtime's first successful endpoint read,
+	// so a restart reads each account once promptly for its grants.
+	GrantsChecked bool
 }
 
 // used returns a window's percent used, reading 0 once the window has reset:
@@ -101,6 +108,8 @@ func (c *quotaCache) recordAttempt(authID string, at time.Time) {
 	c.update(authID, func(s *quotaSample) {
 		s.LastAttemptAt = at
 		s.LastErrorCategory = ""
+		// A forced read is one attempt, even a failed one, so it never loops.
+		s.ForceRead = false
 	})
 }
 
@@ -111,6 +120,11 @@ func (c *quotaCache) recordPoll(authID string, result usageResult, at time.Time)
 		s.PolledAt = at
 		s.LastErrorCategory = ""
 		s.BackoffUntil, s.RateLimits = time.Time{}, 0
+		s.ForceRead = false
+		s.GrantsChecked = true
+		if result.Grants != nil {
+			s.Grants = result.Grants
+		}
 	})
 }
 

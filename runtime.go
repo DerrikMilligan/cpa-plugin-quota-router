@@ -35,6 +35,9 @@ const (
 	minimumRefreshGap = 20 * time.Second
 	// maxCheckInterval is how often the worker looks for stale readings.
 	maxCheckInterval = 30 * time.Second
+	// fullReadInterval caps how long any account goes without an endpoint
+	// read, which is the only source of its reset grants.
+	fullReadInterval = 30 * time.Minute
 )
 
 type pluginRuntime struct {
@@ -45,6 +48,7 @@ type pluginRuntime struct {
 	sessions    *sessionStore
 	lastPicked  map[string]time.Time
 	lastProbe   map[string]time.Time
+	resets      resetLocks
 	host        hostClient
 	fetch       usageFetcher
 	now         func() time.Time
@@ -238,6 +242,9 @@ func (r *pluginRuntime) refreshLoop(ctx context.Context, interval time.Duration,
 // fresh, so accounts carrying traffic are rarely read; missing, refused or
 // rolled-over readings are read promptly; rate-limited accounts wait.
 func needsRead(s quotaSample, now time.Time, pollInterval time.Duration) bool {
+	if s.ForceRead {
+		return true
+	}
 	if now.Before(s.BackoffUntil) {
 		return false
 	}
@@ -247,6 +254,12 @@ func needsRead(s quotaSample, now time.Time, pollInterval time.Duration) bool {
 		return sinceAttempt >= minimumRefreshGap
 	case windowRolledOver(s.FiveHour, s, now), windowRolledOver(s.Weekly, s, now):
 		return sinceAttempt >= minimumRefreshGap
+	case !s.GrantsChecked:
+		return sinceAttempt >= minimumRefreshGap
+	case now.Sub(s.PolledAt) >= fullReadInterval:
+		// Headers carry no reset grants, so even busy accounts get an
+		// occasional full read.
+		return sinceAttempt >= pollInterval
 	default:
 		return now.Sub(s.seenAt()) >= pollInterval && sinceAttempt >= pollInterval
 	}

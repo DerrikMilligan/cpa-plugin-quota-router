@@ -18,6 +18,7 @@ type persistedSample struct {
 	Weekly   windowReading `json:"weekly"`
 	PolledAt time.Time     `json:"polled_at,omitzero"`
 	HeaderAt time.Time     `json:"header_at,omitzero"`
+	Grants   *resetGrants  `json:"grants,omitempty"`
 }
 
 type stateDocument struct {
@@ -61,6 +62,7 @@ func (r *pluginRuntime) loadState() {
 			s.Identity, s.Email = saved.Identity, saved.Email
 			s.FiveHour, s.Weekly = saved.FiveHour, saved.Weekly
 			s.PolledAt, s.HeaderAt = saved.PolledAt, saved.HeaderAt
+			s.Grants = saved.Grants
 			s.HasSample = true
 			restored++
 		})
@@ -86,7 +88,7 @@ func (r *pluginRuntime) saveState() {
 		doc.Samples[authID] = persistedSample{
 			Identity: s.Identity, Email: s.Email,
 			FiveHour: s.FiveHour, Weekly: s.Weekly,
-			PolledAt: s.PolledAt, HeaderAt: s.HeaderAt,
+			PolledAt: s.PolledAt, HeaderAt: s.HeaderAt, Grants: s.Grants,
 		}
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")

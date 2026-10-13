@@ -23,6 +23,8 @@ type usageResult struct {
 	Weekly   windowReading
 	// RetryAfter is the server's requested wait on a 429, when it sent one.
 	RetryAfter time.Duration
+	// Grants are the account's usage-limit resets; nil when not reported.
+	Grants *resetGrants
 }
 
 type usageFetcher func(context.Context, string, time.Duration) (usageResult, string)
@@ -48,8 +50,9 @@ func newHTTPUsageFetcher(endpoint string, transport http.RoundTripper) httpUsage
 }
 
 type usageResponse struct {
-	FiveHour *usageWindow `json:"five_hour"`
-	SevenDay *usageWindow `json:"seven_day"`
+	FiveHour   *usageWindow    `json:"five_hour"`
+	SevenDay   *usageWindow    `json:"seven_day"`
+	CedarEmber json.RawMessage `json:"cedar_ember"`
 }
 
 type usageWindow struct {
@@ -68,6 +71,7 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("anthropic-beta", anthropicOAuthBeta)
+	req.Header.Set("User-Agent", claudeCLIUserAgent)
 
 	resp, err := f.client.Do(req)
 	if err != nil {
@@ -127,7 +131,7 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 	if !ok {
 		return usageResult{}, pollErrorInvalidWindow
 	}
-	return usageResult{FiveHour: fiveHour, Weekly: weekly}, ""
+	return usageResult{FiveHour: fiveHour, Weekly: weekly, Grants: parseResetGrants(payload.CedarEmber)}, ""
 }
 
 // parseWindow reads one usage-endpoint window. A missing window, or one with no
