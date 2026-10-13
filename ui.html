@@ -20,40 +20,54 @@
   * { box-sizing: border-box; }
   body { margin: 0; padding: 20px; background: var(--bg); color: var(--text);
          font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; margin-bottom: 14px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 16px; }
   h1 { font-size: 18px; margin: 0; }
+  .toolbar { margin-left: auto; display: flex; gap: 8px; align-items: center; }
   .meta { color: var(--muted); font-size: 13px; }
   .meta b { color: var(--text); font-weight: 600; }
-  .toolbar { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  .stats { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 14px; }
+  .stat .v { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat .k { color: var(--muted); font-size: 12px; }
   button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
            border-radius: 6px; padding: 4px 10px; cursor: pointer; }
   button:hover { border-color: var(--accent); }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.link { border: 0; background: none; color: var(--accent); padding: 0; font-size: 13px; white-space: nowrap; flex: none; }
   button:disabled { opacity: .5; cursor: default; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; min-width: 980px; }
-  th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
-  th { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
-  tr:last-child td { border-bottom: 0; }
-  .acct { font-weight: 600; }
-  td.status { min-width: 170px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+          display: flex; flex-direction: column; gap: 12px; }
+  .card.held { border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
+  .top { display: flex; align-items: flex-start; gap: 10px; }
+  .who { min-width: 0; flex: 1; }
+  .acct { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sub { color: var(--muted); font-size: 12px; }
+  .headroom { text-align: right; line-height: 1.1; }
+  .headroom .v { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .headroom .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .pills { display: flex; gap: 6px; align-items: center; margin-top: 4px; flex-wrap: wrap; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
   .pill.ok { background: var(--pill-ok); color: var(--pill-ok-text); }
   .pill.bad { background: var(--pill-bad); color: var(--pill-bad-text); }
-  .bar { position: relative; width: 110px; height: 10px; border-radius: 5px; background: var(--track); }
-  .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; }
-  .ceil { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); opacity: .7; }
-  .barline { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
-  .num { font-variant-numeric: tabular-nums; }
-  .headroom { font-size: 16px; font-weight: 700; }
-  .edit { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
-  .edit button { padding: 3px 8px; font-size: 13px; }
+  .pill.plain { background: var(--track); color: var(--muted); }
+  .tag { font-size: 11px; color: var(--accent); font-weight: 600; }
+  .window .label { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }
+  .window .label .num { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .bar { position: relative; height: 14px; border-radius: 7px; background: var(--track); }
+  .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 7px; }
+  .ceil { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--text); opacity: .75; border-radius: 1px; }
+  .window .foot { display: flex; justify-content: space-between; margin-top: 3px; }
+  .reason { font-size: 13px; color: var(--pill-bad-text); }
+  .bottom { display: flex; justify-content: space-between; align-items: center; gap: 8px;
+            border-top: 1px solid var(--line); padding-top: 10px; }
+  .edit { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .edit[hidden] { display: none; }
   .edit label { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
-  .edit input { width: 58px; font: inherit; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px;
+  .edit input { width: 60px; font: inherit; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px;
                 background: var(--bg); color: var(--text); }
   .edit input.dirty { border-color: var(--accent); }
-  .tag { font-size: 11px; color: var(--accent); font-weight: 600; margin-left: 6px; }
+  .edit button { padding: 3px 8px; font-size: 13px; }
   #notice { margin: 0 0 12px; padding: 8px 12px; border-radius: 8px; display: none; }
   #notice.show { display: block; }
   #notice.error { background: var(--pill-bad); color: var(--pill-bad-text); }
@@ -62,8 +76,7 @@
            border-radius: 10px; padding: 16px; }
   #login input { width: 100%; margin: 8px 0; font: inherit; padding: 6px 8px; border: 1px solid var(--line);
                  border-radius: 6px; background: var(--bg); color: var(--text); }
-  .help { color: var(--muted); font-size: 12px; margin-top: 10px; }
-  code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .help { color: var(--muted); font-size: 12px; margin-top: 14px; }
 </style>
 </head>
 <body>
@@ -82,21 +95,14 @@
   <input id="key" type="password" autocomplete="current-password" placeholder="Management key">
   <button class="primary" type="submit">Connect</button>
 </form>
-<div class="card" id="card" hidden>
-  <table>
-    <thead>
-      <tr>
-        <th>Account</th><th>Status</th><th>5-hour</th><th>Weekly</th>
-        <th>Headroom</th><th>Live</th><th>Ceilings (percent used)</th>
-      </tr>
-    </thead>
-    <tbody id="rows"></tbody>
-  </table>
+<div id="content" hidden>
+  <div class="stats" id="stats"></div>
+  <div class="grid" id="cards"></div>
 </div>
 <p class="help">
   Headroom is the smaller of the two windows' points left under the ceiling; new conversations go to the
   account with the most. The dark tick on each bar is the ceiling. Blank ceiling inputs use the defaults.
-  Saving writes the <code>accounts</code> entry in the plugin config and applies at once.
+  Saving updates that account in the plugin config and applies at once.
 </p>
 <script>
 (() => {
@@ -110,6 +116,7 @@
   let key = "";
   let timer = null;
   let editing = false;
+  const openEditors = new Set();
 
   // Theme: follow the Management Center when it saved one, else the OS.
   try {
@@ -192,16 +199,19 @@
     return "read " + (s < 90 ? s + "s" : Math.round(s / 60) + "m") + " ago";
   }
 
-  function bar(used, ceiling, resetAt, known) {
+  function windowBar(name, used, ceiling, resetAt, known) {
     const ratio = ceiling > 0 ? used / ceiling : 1;
     const color = ratio >= 1 ? "var(--bad)" : ratio >= 0.8 ? "var(--warn)" : "var(--ok)";
-    const track = el("div", { class: "bar", title: used.toFixed(1) + "% used of a " + ceiling + "% ceiling" },
-      el("div", { class: "fill", style: "width:" + Math.min(100, Math.max(0, used)) + "%;background:" + color }),
-      el("div", { class: "ceil", style: "left:calc(" + Math.min(100, ceiling) + "% - 1px)" }));
-    return el("div", {},
-      el("div", { class: "barline" }, track,
-        el("span", { class: "num" }, known ? Math.round(used) + "% / " + ceiling + "%" : "-")),
-      el("div", { class: "sub" }, known ? until(resetAt) : ""));
+    return el("div", { class: "window" },
+      el("div", { class: "label" },
+        el("span", {}, name),
+        el("span", { class: "num" }, known ? Math.round(used) + "% of " + ceiling + "%" : "no reading")),
+      el("div", { class: "bar", title: known ? used.toFixed(1) + "% used of a " + ceiling + "% ceiling" : "" },
+        known ? el("div", { class: "fill", style: "width:" + Math.min(100, Math.max(0, used)) + "%;background:" + color }) : null,
+        el("div", { class: "ceil", style: "left:calc(" + Math.min(100, ceiling) + "% - 1px)" })),
+      el("div", { class: "foot sub" },
+        el("span", {}, known ? until(resetAt) : ""),
+        el("span", {}, known ? Math.max(0, Math.round(ceiling - used)) + " pts left" : "")));
   }
 
   function ceilingInput(label, value, fallback) {
@@ -215,30 +225,51 @@
     return { input, wrap: el("label", {}, label, input) };
   }
 
-  function row(account, defaults) {
+  function card(account, defaults) {
+    const id = account.email || account.id;
     const known = account.known;
-    const status = account.eligible
-      ? el("span", { class: "pill ok" }, "routing")
-      : el("span", { class: "pill bad", title: account.reason || "" }, "held");
     const five = ceilingInput("5h", account.override ? account.ceilings.five_hour : null, defaults.five_hour);
-    const week = ceilingInput("wk", account.override ? account.ceilings.weekly : null, defaults.weekly);
+    const week = ceilingInput("Weekly", account.override ? account.ceilings.weekly : null, defaults.weekly);
     const save = el("button", { type: "button", class: "primary" }, "Save");
     const reset = el("button", { type: "button", disabled: !account.override, title: "Remove this account's entry" }, "Use defaults");
-    save.addEventListener("click", () => saveCeilings(account.email || account.id, five.input.value, week.input.value, save));
-    reset.addEventListener("click", () => saveCeilings(account.email || account.id, "", "", reset));
-    return el("tr", {},
-      el("td", {},
-        el("div", { class: "acct" }, account.email || account.id,
-          account.override ? el("span", { class: "tag", title: "Ceilings set for this account" }, "custom") : null),
-        el("div", { class: "sub" }, ago(account.seen_at), account.last_error ? " - " + account.last_error : "",
-          account.backoff_until ? " - next read " + new Date(account.backoff_until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "")),
-      el("td", { class: "status" }, status, account.eligible ? null : el("div", { class: "sub" }, account.reason || "")),
-      el("td", {}, bar(account.five_hour_used, account.ceilings.five_hour, account.five_hour_reset_at, known)),
-      el("td", {}, bar(account.weekly_used, account.ceilings.weekly, account.weekly_reset_at, known)),
-      el("td", { class: "num headroom" }, known ? Math.max(0, Math.round(account.headroom)) : "-"),
-      el("td", { class: "num" }, account.live_sessions),
-      el("td", {},
-        el("div", { class: "edit" }, five.wrap, week.wrap, save, reset)));
+    const editor = el("div", { class: "edit", hidden: !openEditors.has(id) }, five.wrap, week.wrap, save, reset);
+    const toggle = el("button", { type: "button", class: "link" }, openEditors.has(id) ? "Close" : "Edit ceilings");
+    toggle.addEventListener("click", () => {
+      const open = editor.hidden;
+      editor.hidden = !open;
+      toggle.textContent = open ? "Close" : "Edit ceilings";
+      if (open) openEditors.add(id); else openEditors.delete(id);
+    });
+    save.addEventListener("click", () => saveCeilings(id, five.input.value, week.input.value, save));
+    reset.addEventListener("click", () => saveCeilings(id, "", "", reset));
+
+    const read = [ago(account.seen_at)];
+    if (account.last_error) read.push(account.last_error);
+    if (account.backoff_until) read.push("next read " + new Date(account.backoff_until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
+
+    return el("section", { class: "card" + (account.eligible ? "" : " held") },
+      el("div", { class: "top" },
+        el("div", { class: "who" },
+          el("div", { class: "acct", title: id }, id),
+          el("div", { class: "pills" },
+            account.eligible ? el("span", { class: "pill ok" }, "routing") : el("span", { class: "pill bad" }, "held"),
+            el("span", { class: "pill plain", title: "Conversations bound to this account" },
+              account.live_sessions + " live"),
+            account.override ? el("span", { class: "tag", title: "Ceilings set for this account" }, "custom") : null)),
+        el("div", { class: "headroom" },
+          el("div", { class: "v" }, known ? Math.max(0, Math.round(account.headroom)) : "-"),
+          el("div", { class: "k" }, "headroom"))),
+      account.eligible ? null : el("div", { class: "reason" }, account.reason || ""),
+      windowBar("5-hour", account.five_hour_used, account.ceilings.five_hour, account.five_hour_reset_at, known),
+      windowBar("Weekly", account.weekly_used, account.ceilings.weekly, account.weekly_reset_at, known),
+      el("div", { class: "bottom" },
+        el("span", { class: "sub" }, read.join(" - ")),
+        toggle),
+      editor);
+  }
+
+  function stat(value, label) {
+    return el("div", { class: "stat" }, el("div", { class: "v" }, value), el("div", { class: "k" }, label));
   }
 
   async function load(force) {
@@ -246,15 +277,21 @@
     try {
       const status = await api("GET", STATUS);
       const d = status.default_ceilings;
+      const accounts = (status.accounts || []).slice().sort((a, b) =>
+        (b.eligible - a.eligible) || (b.headroom - a.headroom) || String(a.email).localeCompare(String(b.email)));
+      const routing = accounts.filter(a => a.eligible).length;
+      const live = accounts.reduce((n, a) => n + (a.live_sessions || 0), 0);
       document.getElementById("summary").replaceChildren(
         "Defaults ", el("b", {}, d.five_hour + "% 5h"), " / ", el("b", {}, d.weekly + "% weekly"),
         " - models ", el("b", {}, (status.models || []).join(", ")),
         " - spread ", el("b", {}, status.spread_band), " - rebalance ", el("b", {}, status.rebalance_margin),
         " - poll ", el("b", {}, status.poll_interval));
-      const accounts = (status.accounts || []).slice().sort((a, b) =>
-        (b.eligible - a.eligible) || (b.headroom - a.headroom) || String(a.email).localeCompare(String(b.email)));
-      document.getElementById("rows").replaceChildren(...accounts.map(a => row(a, d)));
-      document.getElementById("card").hidden = false;
+      document.getElementById("stats").replaceChildren(
+        stat(routing + " / " + accounts.length, "accounts routing"),
+        stat(live, "live conversations"),
+        stat(accounts.length ? Math.round(Math.max(...accounts.map(a => a.known ? a.headroom : 0))) : "-", "best headroom"));
+      document.getElementById("cards").replaceChildren(...accounts.map(a => card(a, d)));
+      document.getElementById("content").hidden = false;
       document.getElementById("login").style.display = "none";
       document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
       editing = false;
@@ -304,7 +341,7 @@
   function askForKey(message) {
     clearInterval(timer);
     sessionStorage.removeItem(SESSION_KEY);
-    document.getElementById("card").hidden = true;
+    document.getElementById("content").hidden = true;
     document.getElementById("login").style.display = "block";
     if (message) notice(message, "error");
   }

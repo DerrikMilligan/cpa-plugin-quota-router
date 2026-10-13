@@ -95,10 +95,11 @@ entities literally.
 ## Management Center page
 
 The plugin adds a **Quota Balancer** entry to the Management Center sidebar.
-It shows each account's 5-hour and weekly usage against its ceilings (the dark
-tick on each bar), headroom, live conversations, reset times, and why an
-account is held. Each row edits that account's ceilings in place; blank inputs
-use the defaults, and **Use defaults** removes the entry. Saving PATCHes the
+One card per account shows its 5-hour and weekly usage against its ceilings
+(the dark tick on each bar), points left, headroom, live conversations, reset
+times, and why an account is held. **Edit ceilings** on a card sets that
+account's ceilings; blank inputs use the defaults, and **Use defaults** removes
+the entry. Saving PATCHes the
 `accounts` config and applies at once.
 
 The page itself is static (resource routes are not management-authenticated)
