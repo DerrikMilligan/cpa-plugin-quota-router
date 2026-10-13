@@ -413,10 +413,10 @@ five-hour-weight: 0.5
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Models != nil || cfg.Default != (ceilings{85, 88}) {
+	if cfg.Models != nil || cfg.Default.FiveHour != 85 || cfg.Default.Weekly != 88 || cfg.Default.FireSaleHours != defaultFireSaleHours {
 		t.Fatalf("defaults = %#v models=%v", cfg.Default, cfg.Models)
 	}
-	if got := cfg.ceilingsFor("kphair@isolvedhcm.com", "", ""); got != (ceilings{60, 88}) {
+	if got := cfg.ceilingsFor("kphair@isolvedhcm.com", "", ""); got.FiveHour != 60 || got.Weekly != 88 || got.FireSaleHours != defaultFireSaleHours {
 		t.Fatalf("override = %#v, want unset fields to inherit the default", got)
 	}
 	if cfg.FiveHourWeight != 0.5 {
@@ -425,7 +425,7 @@ five-hour-weight: 0.5
 	if cfg.PollInterval != minimumPollInterval || cfg.MaxStaleness != defaultMaxStaleness {
 		t.Fatalf("poll=%v staleness=%v", cfg.PollInterval, cfg.MaxStaleness)
 	}
-	for _, bad := range []string{"five-hour-ceiling: 0", "weekly-ceiling: 101", "accounts: {a: {weekly-ceiling: -1}}", "spread-band: -1", "poll-interval: soon", "five-hour-weight: -0.1", "five-hour-weight: 5", "reset-weight: 4"} {
+	for _, bad := range []string{"five-hour-ceiling: 0", "weekly-ceiling: 101", "accounts: {a: {weekly-ceiling: -1}}", "spread-band: -1", "poll-interval: soon", "five-hour-weight: -0.1", "five-hour-weight: 5", "reset-weight: 4", "fire-sale-hours: -1", "accounts: {a: {fire-sale-hours: 200}}"} {
 		raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte(bad)})
 		if _, err := decodeLifecycleConfig(raw); err == nil {
 			t.Fatalf("%q should be rejected", bad)
@@ -991,5 +991,40 @@ func TestResetUrgencyBounds(t *testing.T) {
 	}
 	if got := resetUrgency(testNow.Add(24*time.Hour), testNow, 0.5); math.Abs(got-math.Sqrt(7)) > 1e-9 {
 		t.Errorf("weight 0.5 urgency %v", got)
+	}
+}
+
+func TestFireSaleLiftsTheWeeklyCeilingNearTheReset(t *testing.T) {
+	r, c := newTestRuntime(t, defaultPluginConfig(), map[string][2]float64{"a@x.com": {10, 95}})
+	setWeeklyReset(r, "a@x.com", 13*time.Hour)
+	if _, errEnv := pickFor(t, r, "", "a@x.com"); errEnv == nil {
+		t.Fatalf("13h before the reset the 90%% weekly ceiling should still hold")
+	}
+	c.advance(time.Hour + time.Second) // now inside the 12h fire sale
+	r.handleUsage(usageRecord{AuthID: authIDFor("a@x.com"), ResponseHeaders: rateHeaders(0.10, 0.95)})
+	if got := mustPick(t, r, "", "a@x.com"); got != "a@x.com" {
+		t.Fatalf("fire sale did not lift the weekly ceiling")
+	}
+	view := r.status().Accounts[0]
+	if !view.FireSale || view.Ceilings.Weekly != 100 || view.WeeklyRoom != 5 {
+		t.Fatalf("fire sale view = %+v", view)
+	}
+}
+
+func TestFireSaleKeepsTheFiveHourCeiling(t *testing.T) {
+	r, _ := newTestRuntime(t, defaultPluginConfig(), map[string][2]float64{"a@x.com": {92, 50}})
+	setWeeklyReset(r, "a@x.com", 2*time.Hour)
+	if _, errEnv := pickFor(t, r, "", "a@x.com"); errEnv == nil {
+		t.Fatalf("fire sale must not lift the 5-hour ceiling")
+	}
+}
+
+func TestFireSaleCanBeDisabledPerAccount(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.Accounts = map[string]ceilings{"a@x.com": {FiveHour: 90, Weekly: 90, FireSaleHours: 0}}
+	r, _ := newTestRuntime(t, cfg, map[string][2]float64{"a@x.com": {10, 95}})
+	setWeeklyReset(r, "a@x.com", 2*time.Hour)
+	if _, errEnv := pickFor(t, r, "", "a@x.com"); errEnv == nil {
+		t.Fatalf("an account with fire-sale-hours 0 was opened up")
 	}
 }

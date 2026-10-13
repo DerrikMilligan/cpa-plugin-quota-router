@@ -25,7 +25,12 @@ recovers within hours, so by default it counts a quarter (`five-hour-weight:
 0.25`). Urgency makes weekly room that is about to expire count up to 7 times
 (`reset-weight: 1`; 0 ignores reset time), so accounts tend to reach their
 weekly ceilings together instead of some resetting with budget unused. Both
-ceilings stay hard limits whatever the weights. The Management Center page
+ceilings stay hard limits whatever the weights.
+
+**Fire sale.** Within `fire-sale-hours` (default 12) of an account's weekly
+reset, its weekly ceiling is lifted to 100%: budget left at the reset is lost
+anyway. The 5-hour ceiling still applies, and an account can opt out with
+`fire-sale-hours: 0` in its `accounts` entry. The Management Center page
 shows the formula and, on hover, each account's calculation.
 
 - **Ceilings are hard.** An account at or above either ceiling, refused
@@ -76,8 +81,10 @@ plugins:
         example@example.com:     # matches no account; a template to copy
           five-hour-ceiling: 90  # unset fields inherit the defaults
           weekly-ceiling: 90
+          fire-sale-hours: 12    # 0 keeps this account's weekly ceiling to the end
       five-hour-weight: 0.25     # how much 5-hour room counts in headroom
       reset-weight: 1            # how strongly a near weekly reset raises headroom
+      fire-sale-hours: 12        # lift the weekly ceiling to 100 this close to the weekly reset
       spread-band: 10            # headroom points treated as a tie
       rebalance-margin: 25       # headroom gap that moves a live conversation
       probe-unread: true         # unreadable accounts take one conversation per 5m

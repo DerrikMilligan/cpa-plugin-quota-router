@@ -19,8 +19,9 @@ type lifecycleRequest struct {
 }
 
 type rawCeilings struct {
-	FiveHour *float64 `yaml:"five-hour-ceiling"`
-	Weekly   *float64 `yaml:"weekly-ceiling"`
+	FiveHour      *float64 `yaml:"five-hour-ceiling"`
+	Weekly        *float64 `yaml:"weekly-ceiling"`
+	FireSaleHours *float64 `yaml:"fire-sale-hours"`
 }
 
 type rawPluginConfig struct {
@@ -28,6 +29,7 @@ type rawPluginConfig struct {
 	Models          *[]string              `yaml:"models"`
 	FiveHour        *float64               `yaml:"five-hour-ceiling"`
 	Weekly          *float64               `yaml:"weekly-ceiling"`
+	FireSaleHours   *float64               `yaml:"fire-sale-hours"`
 	Accounts        map[string]rawCeilings `yaml:"accounts"`
 	FiveHourWeight  *float64               `yaml:"five-hour-weight"`
 	ResetWeight     *float64               `yaml:"reset-weight"`
@@ -45,6 +47,9 @@ type rawPluginConfig struct {
 type ceilings struct {
 	FiveHour float64 `json:"five_hour"`
 	Weekly   float64 `json:"weekly"`
+	// FireSaleHours lifts the weekly ceiling to 100 within this many hours of
+	// the weekly reset, when budget left over would be lost anyway. 0 disables.
+	FireSaleHours float64 `json:"fire_sale_hours"`
 }
 
 type pluginConfig struct {
@@ -77,7 +82,7 @@ type pluginConfig struct {
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
 		Enabled:         true,
-		Default:         ceilings{FiveHour: defaultFiveHourCeiling, Weekly: defaultWeeklyCeiling},
+		Default:         ceilings{FiveHour: defaultFiveHourCeiling, Weekly: defaultWeeklyCeiling, FireSaleHours: defaultFireSaleHours},
 		Accounts:        map[string]ceilings{},
 		SpreadBand:      defaultSpreadBand,
 		RebalanceMargin: defaultRebalanceMargin,
@@ -152,6 +157,9 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 	if decoded.Weekly != nil {
 		cfg.Default.Weekly = *decoded.Weekly
 	}
+	if decoded.FireSaleHours != nil {
+		cfg.Default.FireSaleHours = *decoded.FireSaleHours
+	}
 	if err := validCeilings("default", cfg.Default); err != nil {
 		return pluginConfig{}, err
 	}
@@ -166,6 +174,9 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 		}
 		if raw.Weekly != nil {
 			account.Weekly = *raw.Weekly
+		}
+		if raw.FireSaleHours != nil {
+			account.FireSaleHours = *raw.FireSaleHours
 		}
 		if err := validCeilings(key, account); err != nil {
 			return pluginConfig{}, err
@@ -242,6 +253,9 @@ func validCeilings(name string, c ceilings) error {
 	}
 	if !finite(c.Weekly) || c.Weekly <= 0 || c.Weekly > 100 {
 		return fmt.Errorf("%s weekly-ceiling must be above 0 and at most 100", name)
+	}
+	if !finite(c.FireSaleHours) || c.FireSaleHours < 0 || c.FireSaleHours > 168 {
+		return fmt.Errorf("%s fire-sale-hours must be between 0 and 168", name)
 	}
 	return nil
 }
@@ -323,7 +337,8 @@ func pluginRegistration() registration {
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Claude model IDs to balance, one per item. A single * or an empty list balances every Claude model. Default: all."},
 				{Name: "five-hour-ceiling", Type: pluginapi.ConfigFieldTypeNumber, Description: "Hard limit in percent used on the 5-hour session window. An account at or above it takes no requests until a reading shows it back under. Default: 90."},
 				{Name: "weekly-ceiling", Type: pluginapi.ConfigFieldTypeNumber, Description: "Hard limit in percent used on the weekly window. An account at or above it takes no requests until a reading shows it back under. Default: 90."},
-				{Name: "accounts", Type: pluginapi.ConfigFieldTypeObject, Description: "Per-account ceilings that override the two defaults above, as a JSON object keyed by account email or auth file name. Each value can set five-hour-ceiling and weekly-ceiling in percent; a field left out uses the default. The example@example.com entry matches no account: copy it, change the email and set the numbers. Delete an entry to return that account to the defaults. A lower ceiling also means less traffic, since the account has less headroom."},
+				{Name: "fire-sale-hours", Type: pluginapi.ConfigFieldTypeNumber, Description: "Within this many hours of an account weekly reset its weekly ceiling is lifted to 100 percent, since budget left at the reset is lost anyway. The 5-hour ceiling still applies. 0 disables. Default: 12."},
+				{Name: "accounts", Type: pluginapi.ConfigFieldTypeObject, Description: "Per-account ceilings that override the defaults above, as a JSON object keyed by account email or auth file name. Each value can set five-hour-ceiling, weekly-ceiling and fire-sale-hours; a field left out uses the default. The example@example.com entry matches no account: copy it, change the email and set the numbers. Delete an entry to return that account to the defaults. A lower ceiling also means less traffic, since the account has less headroom."},
 				{Name: "five-hour-weight", Type: pluginapi.ConfigFieldTypeNumber, Description: "How much the 5-hour window counts in headroom: headroom = weekly room x reset urgency + weight x 5-hour room, where room = ceiling - used. 0 ranks by weekly alone; 1 counts both fully. Both ceilings stay hard limits either way. Default: 0.25."},
 				{Name: "reset-weight", Type: pluginapi.ConfigFieldTypeNumber, Description: "How much a near weekly reset raises headroom: reset urgency = (7 days / days until the weekly reset) to this power, with days held between 1 and 7, so weekly room about to expire is used first. 0 ignores reset time. Default: 1."},
 				{Name: "spread-band", Type: pluginapi.ConfigFieldTypeNumber, Description: "Accounts within this many headroom points of the best count as tied, and new conversations spread across them by load. Default: 10."},

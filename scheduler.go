@@ -66,7 +66,9 @@ type accountView struct {
 	Name     string   `json:"name,omitempty"`
 	Ceilings ceilings `json:"ceilings"`
 	// Override reports ceilings set by an accounts entry, not the defaults.
-	Override bool    `json:"override"`
+	Override bool `json:"override"`
+	// FireSale reports the weekly ceiling lifted to 100 near the weekly reset.
+	FireSale bool    `json:"fire_sale,omitempty"`
 	Known    bool    `json:"known"`
 	Fresh    bool    `json:"fresh"`
 	Refused  bool    `json:"refused,omitempty"`
@@ -113,6 +115,10 @@ func evaluate(authID string, sample quotaSample, cfg pluginConfig, now time.Time
 	}
 	view.FiveHour = sample.FiveHour.used(now)
 	view.Weekly = sample.Weekly.used(now)
+	if inFireSale(sample.Weekly.ResetAt, now, view.Ceilings.FireSaleHours) {
+		view.FireSale = true
+		view.Ceilings.Weekly = 100
+	}
 	view.WeeklyRoom = math.Max(0, view.Ceilings.Weekly-view.Weekly)
 	view.FiveHourRoom = math.Max(0, view.Ceilings.FiveHour-view.FiveHour)
 	view.ResetUrgency = resetUrgency(sample.Weekly.ResetAt, now, cfg.ResetWeight)
@@ -145,6 +151,15 @@ func resetUrgency(resetAt, now time.Time, weight float64) float64 {
 	}
 	left := min(max(resetAt.Sub(now), 24*time.Hour), weeklyWindow)
 	return math.Pow(float64(weeklyWindow)/float64(left), weight)
+}
+
+// inFireSale reports a weekly reset within hours, when weekly budget left
+// over would be lost anyway.
+func inFireSale(resetAt, now time.Time, hours float64) bool {
+	if hours <= 0 || resetAt.IsZero() || !now.Before(resetAt) {
+		return false
+	}
+	return resetAt.Sub(now) <= time.Duration(hours*float64(time.Hour))
 }
 
 func formatTime(t time.Time) string {

@@ -14,6 +14,7 @@ const (
 	defaultRebalanceMargin     = 25.0
 	defaultFiveHourWeight      = 0.25
 	defaultResetWeight         = 1.0
+	defaultFireSaleHours       = 12.0
 	weeklyWindow               = 7 * 24 * time.Hour
 	defaultMaxSessions         = 65536
 	minimumPollInterval        = 30 * time.Second
@@ -47,7 +48,7 @@ const (
 	pollErrorRead              = "read_error"
 )
 
-var pluginVersion = "1.6.0"
+var pluginVersion = "1.6.1"
 
 // Variables only so tests can inject local fixtures.
 var (
