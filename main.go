@@ -44,7 +44,7 @@ const (
 	pollErrorRead              = "read_error"
 )
 
-var pluginVersion = "1.5.0"
+var pluginVersion = "1.5.1"
 
 // Variables only so tests can inject local fixtures.
 var (

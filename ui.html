@@ -194,8 +194,14 @@
     return area.value;
   }
 
+  // "weekly incl. overage" is the weekly window again, so it folds into "weekly".
   function clearsText(clears) {
-    return (clears || []).map(c => WINDOW_NAMES[c] || decode(c)).join(" + ") || "unknown windows";
+    const names = [];
+    for (const c of clears || []) {
+      const name = c === "seven_day_overage_included" ? "weekly" : (WINDOW_NAMES[c] || decode(c));
+      if (!names.includes(name)) names.push(name);
+    }
+    return names.join(" + ") || "unknown windows";
   }
 
   function resetsBlock(account, id) {
@@ -215,7 +221,8 @@
     button.addEventListener("click", () => useReset(account, id, grant, r.available, button));
     return el("div", { class: "resets" },
       el("div", { class: "what" },
-        el("div", { class: "title" }, title, el("span", { class: "sub" }, " - clears " + clearsText(grant.clears) + (ends ? ", " + ends : ""))),
+        el("div", { class: "title" }, title),
+        el("div", { class: "sub" }, "Clears " + clearsText(grant.clears) + (ends ? " - " + ends : "")),
         el("div", { class: "grant", title: decode(grant.label) }, usable ? decode(grant.label) : decode(grant.unusable || "") + " - " + decode(grant.label))),
       button);
   }
