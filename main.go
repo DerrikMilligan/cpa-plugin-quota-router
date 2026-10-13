@@ -15,6 +15,7 @@ const (
 	defaultMaxSessions         = 65536
 	minimumPollInterval        = 30 * time.Second
 	maxRateLimitBackoff        = 15 * time.Minute
+	usageReadSpacing           = 5 * time.Second
 	defaultUsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
 	anthropicOAuthBeta         = "oauth-2025-04-20"
 	maxUsageResponseBytes      = 64 << 10
@@ -40,7 +41,7 @@ const (
 	pollErrorRead              = "read_error"
 )
 
-var pluginVersion = "1.3.0"
+var pluginVersion = "1.3.1"
 
 // Variable only so the C-shared integration test can inject a local fixture.
 var usageEndpoint = defaultUsageEndpoint
@@ -49,6 +50,7 @@ var activeRuntime = func() *pluginRuntime {
 	r := newPluginRuntime(cgoHostClient{}, newHTTPUsageFetcher(usageEndpoint, nil).fetch, time.Now)
 	r.instanceMarker, r.instanceToken = defaultInstanceMarker(), newInstanceToken()
 	r.stateFile = defaultStateFile()
+	r.readSpacing = usageReadSpacing
 	return r
 }()
 

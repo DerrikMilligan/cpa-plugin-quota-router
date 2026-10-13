@@ -61,6 +61,10 @@ type pluginRuntime struct {
 	stateFile    string
 	stateLoaded  bool
 	savedVersion uint64
+	// readSpacing is the minimum wall-clock gap between usage reads; lastRead
+	// is only touched by the worker goroutine.
+	readSpacing time.Duration
+	lastRead    time.Time
 	// pollMu guards pollDone, which is closed and replaced after every
 	// refresh pass so picks can wait for fresh readings.
 	pollMu   sync.Mutex
@@ -274,9 +278,22 @@ func (r *pluginRuntime) refreshAll(ctx context.Context) {
 			return
 		}
 		sample, _ := r.cache.snapshot(auth.ID)
-		if needsRead(sample, r.now(), cfg.PollInterval) {
-			r.pollAuth(ctx, auth, cfg)
+		if !needsRead(sample, r.now(), cfg.PollInterval) {
+			continue
 		}
+		// Space reads out: the usage endpoint rate-limits bursts across
+		// accounts, so a pass never fires them back to back.
+		if !r.lastRead.IsZero() && r.readSpacing > 0 {
+			if wait := r.readSpacing - time.Since(r.lastRead); wait > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(wait):
+				}
+			}
+		}
+		r.pollAuth(ctx, auth, cfg)
+		r.lastRead = time.Now()
 	}
 }
 

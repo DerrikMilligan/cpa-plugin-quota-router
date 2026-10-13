@@ -747,3 +747,33 @@ func TestReadingsSurviveARestart(t *testing.T) {
 		t.Fatalf("stale restored reading was not refreshed: %d", secondReads.Load())
 	}
 }
+
+func TestUsageReadsAreSpacedOut(t *testing.T) {
+	host := &fakeHost{}
+	for i, email := range []string{"a@x.com", "b@x.com", "c@x.com"} {
+		host.entries = append(host.entries, pluginapi.HostAuthFileEntry{
+			ID: authIDFor(email), AuthIndex: fmt.Sprint(i + 1), Provider: "claude", Path: "/auth/" + email, Email: email,
+		})
+	}
+	var mu sync.Mutex
+	var at []time.Time
+	fetch := func(context.Context, string, time.Duration) (usageResult, string) {
+		mu.Lock()
+		at = append(at, time.Now())
+		mu.Unlock()
+		return usageResult{Weekly: windowReading{Used: 10}}, ""
+	}
+	r := newPluginRuntime(host, fetch, time.Now)
+	cfg := defaultPluginConfig()
+	r.config.Store(&cfg)
+	r.readSpacing = 40 * time.Millisecond
+	r.refreshAll(context.Background())
+	if len(at) != 3 {
+		t.Fatalf("reads = %d, want 3", len(at))
+	}
+	for i := 1; i < len(at); i++ {
+		if gap := at[i].Sub(at[i-1]); gap < 35*time.Millisecond {
+			t.Fatalf("reads %d and %d only %v apart", i-1, i, gap)
+		}
+	}
+}
