@@ -1,5 +1,5 @@
 PLUGIN_NAME ?= quota-balancer
-VERSION ?= 1.0.0
+VERSION ?= 1.0.1
 BUILD_DIR ?= dist
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)

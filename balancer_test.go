@@ -446,3 +446,46 @@ func TestAuthFileRewriteKeepsTheReading(t *testing.T) {
 		t.Fatalf("a different account in the slot kept the old reading")
 	}
 }
+
+func TestFirstPickWaitsForTheStartupRead(t *testing.T) {
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{{
+		ID: authIDFor("a@x.com"), AuthIndex: "1", Provider: "claude", Path: "/auth/a", Email: "a@x.com",
+	}}}
+	release := make(chan struct{})
+	fetch := func(_ context.Context, _ string, _ time.Duration) (usageResult, string) {
+		<-release
+		return usageResult{Weekly: windowReading{Used: 10}}, ""
+	}
+	r := newPluginRuntime(host, fetch, time.Now)
+	r.applyConfig(defaultPluginConfig())
+	defer r.shutdown()
+	time.AfterFunc(100*time.Millisecond, func() { close(release) })
+	if got := mustPick(t, r, "", "a@x.com"); got != "a@x.com" {
+		t.Fatalf("picked %s", got)
+	}
+}
+
+func TestOnDemandRefreshDoesNotHammerAnUnreadableAccount(t *testing.T) {
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{{
+		ID: authIDFor("a@x.com"), AuthIndex: "1", Provider: "claude", Path: "/auth/a", Email: "a@x.com",
+	}}}
+	calls := 0
+	fetch := func(context.Context, string, time.Duration) (usageResult, string) {
+		calls++
+		return usageResult{}, pollErrorRateLimited
+	}
+	c := &clock{now: testNow}
+	r := newPluginRuntime(host, fetch, c.Now)
+	r.refreshAll(context.Background(), false)
+	for i := 0; i < 5; i++ {
+		r.refreshAll(context.Background(), true)
+	}
+	if calls != 1 {
+		t.Fatalf("usage endpoint read %d times within the refresh gap, want 1", calls)
+	}
+	c.advance(minimumRefreshGap)
+	r.refreshAll(context.Background(), true)
+	if calls != 2 {
+		t.Fatalf("calls = %d after the gap, want 2", calls)
+	}
+}

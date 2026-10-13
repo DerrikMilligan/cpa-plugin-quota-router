@@ -129,42 +129,22 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
 
-	r.pickMu.Lock()
-	defer r.pickMu.Unlock()
-	now := r.now()
-	live := r.sessions.live(now, cfg.AffinityTTL)
-
-	var views []accountView
-	byID := make(map[string]accountView)
-	unknown := false
-	for _, candidate := range req.Candidates {
-		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
-		if (provider != "" && provider != "claude") || candidate.ID == "" {
-			continue
-		}
-		sample, ok := r.cache.snapshot(candidate.ID)
-		if !ok {
-			unknown = true
-		}
-		view := evaluate(candidate.ID, sample, cfg, now)
-		view.LiveSessions = live[candidate.ID]
-		views = append(views, view)
-		byID[view.ID] = view
-	}
-	if unknown {
-		r.requestRefresh()
-	}
+	views, byID, best, unread := r.candidateViews(req, cfg)
 	if len(views) == 0 {
 		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
-
-	best := -math.MaxFloat64
-	for _, view := range views {
-		if view.Eligible && view.Headroom > best {
-			best = view.Headroom
-		}
+	if best == noHeadroom && unread {
+		// Only missing readings stand in the way (startup, a new account):
+		// wait briefly for a poll pass rather than refuse.
+		r.requestRefresh()
+		r.waitForPoll(min(cfg.RequestTimeout, maxFirstReadWait))
 	}
-	if best == -math.MaxFloat64 {
+
+	r.pickMu.Lock()
+	defer r.pickMu.Unlock()
+	now := r.now()
+	views, byID, best, _ = r.candidateViews(req, cfg)
+	if best == noHeadroom {
 		return pluginapi.SchedulerPickResponse{}, exhaustedError(views)
 	}
 
@@ -206,6 +186,43 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 		r.sessions.bind(key, chosen, now)
 	}
 	return pluginapi.SchedulerPickResponse{AuthID: chosen, Handled: true}, nil
+}
+
+const (
+	noHeadroom       = -math.MaxFloat64
+	maxFirstReadWait = 5 * time.Second
+)
+
+// candidateViews evaluates the Claude candidates. best is the highest eligible
+// headroom (noHeadroom when none qualifies); unread reports a candidate with
+// no reading yet, which also queues a refresh.
+func (r *pluginRuntime) candidateViews(req pluginapi.SchedulerPickRequest, cfg pluginConfig) ([]accountView, map[string]accountView, float64, bool) {
+	now := r.now()
+	live := r.sessions.live(now, cfg.AffinityTTL)
+	var views []accountView
+	byID := make(map[string]accountView)
+	best, unread := noHeadroom, false
+	for _, candidate := range req.Candidates {
+		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
+		if (provider != "" && provider != "claude") || candidate.ID == "" {
+			continue
+		}
+		sample, _ := r.cache.snapshot(candidate.ID)
+		if !sample.HasSample {
+			unread = true
+		}
+		view := evaluate(candidate.ID, sample, cfg, now)
+		view.LiveSessions = live[candidate.ID]
+		views = append(views, view)
+		byID[view.ID] = view
+		if view.Eligible && view.Headroom > best {
+			best = view.Headroom
+		}
+	}
+	if unread {
+		r.requestRefresh()
+	}
+	return views, byID, best, unread
 }
 
 func exhaustedError(views []accountView) *envelopeError {

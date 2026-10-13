@@ -40,8 +40,10 @@ type pluginRuntime struct {
 	wake        chan struct{}
 	cancel      context.CancelFunc
 	done        chan struct{}
-	// polled is signalled after every refresh pass; tests wait on it.
-	polled chan struct{}
+	// pollMu guards pollDone, which is closed and replaced after every
+	// refresh pass so picks can wait for fresh readings.
+	pollMu   sync.Mutex
+	pollDone chan struct{}
 }
 
 func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time) *pluginRuntime {
@@ -55,7 +57,7 @@ func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time)
 		host:       host,
 		fetch:      fetch,
 		now:        now,
-		polled:     make(chan struct{}, 1),
+		pollDone:   make(chan struct{}),
 	}
 	cfg := defaultPluginConfig()
 	runtime.config.Store(&cfg)
@@ -136,6 +138,19 @@ func (r *pluginRuntime) requestRefresh() {
 	}
 }
 
+// waitForPoll blocks until the next refresh pass finishes or timeout passes.
+func (r *pluginRuntime) waitForPoll(timeout time.Duration) {
+	r.pollMu.Lock()
+	done := r.pollDone
+	r.pollMu.Unlock()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+}
+
 func (r *pluginRuntime) refreshLoop(ctx context.Context, interval time.Duration, wake <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(interval)
@@ -155,10 +170,10 @@ func (r *pluginRuntime) refreshLoop(ctx context.Context, interval time.Duration,
 
 func (r *pluginRuntime) refreshAll(ctx context.Context, onDemand bool) {
 	defer func() {
-		select {
-		case r.polled <- struct{}{}:
-		default:
-		}
+		r.pollMu.Lock()
+		close(r.pollDone)
+		r.pollDone = make(chan struct{})
+		r.pollMu.Unlock()
 	}()
 	if r.host == nil || r.fetch == nil || ctx.Err() != nil {
 		return
@@ -177,7 +192,7 @@ func (r *pluginRuntime) refreshAll(ctx context.Context, onDemand bool) {
 		}
 		if onDemand {
 			sample, _ := r.cache.snapshot(auth.ID)
-			if sample.HasSample && !sample.refused() && r.now().Sub(sample.LastAttemptAt) < minimumRefreshGap {
+			if r.now().Sub(sample.LastAttemptAt) < minimumRefreshGap {
 				continue
 			}
 		}
