@@ -23,24 +23,25 @@ type claudeCredential struct {
 	AccessToken string `json:"access_token"`
 }
 
+// minimumRefreshGap keeps on-demand refreshes (refusals, new accounts) from
+// re-reading an account more often than this.
+const minimumRefreshGap = 20 * time.Second
+
 type pluginRuntime struct {
 	lifecycleMu sync.Mutex
-	refreshMu   sync.Mutex
+	pickMu      sync.Mutex
 	config      atomic.Pointer[pluginConfig]
 	cache       quotaCache
+	sessions    *sessionStore
+	lastPicked  map[string]time.Time
 	host        hostClient
 	fetch       usageFetcher
 	now         func() time.Time
 	wake        chan struct{}
 	cancel      context.CancelFunc
 	done        chan struct{}
-	pendingAll  bool
-	pendingIDs  map[string]struct{}
-	inFlightAll bool
-	inFlightIDs map[string]struct{}
-	// Closed/replaced on worker completion so synchronous picks can join the
-	// existing per-seat coalesced work without polling or duplicate fetches.
-	refreshChanged chan struct{}
+	// polled is signalled after every refresh pass; tests wait on it.
+	polled chan struct{}
 }
 
 func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time) *pluginRuntime {
@@ -48,51 +49,58 @@ func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time)
 		now = time.Now
 	}
 	runtime := &pluginRuntime{
-		cache:          quotaCache{samples: make(map[string]quotaSample)},
-		host:           host,
-		fetch:          fetch,
-		now:            now,
-		refreshChanged: make(chan struct{}),
+		cache:      quotaCache{samples: make(map[string]quotaSample)},
+		sessions:   newSessionStore(defaultMaxSessions),
+		lastPicked: make(map[string]time.Time),
+		host:       host,
+		fetch:      fetch,
+		now:        now,
+		polled:     make(chan struct{}, 1),
 	}
 	cfg := defaultPluginConfig()
 	runtime.config.Store(&cfg)
 	return runtime
 }
 
+func (r *pluginRuntime) loadedConfig() pluginConfig {
+	if cfg := r.config.Load(); cfg != nil {
+		return *cfg
+	}
+	return defaultPluginConfig()
+}
+
 func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
 
+	previous := r.loadedConfig()
 	r.config.Store(&cfg)
+	if previous.AffinityTTL != cfg.AffinityTTL {
+		r.sessions.reset()
+	}
+	fields := map[string]any{
+		"five_hour_ceiling": cfg.Default.FiveHour,
+		"weekly_ceiling":    cfg.Default.Weekly,
+		"account_overrides": len(cfg.Accounts),
+		"models":            cfg.Models,
+		"poll_interval":     cfg.PollInterval.String(),
+	}
 	if !cfg.Enabled {
 		r.stopLocked()
-		r.cache.reconcile(nil)
 		return
 	}
-	if r.cancel == nil {
-		ctx, cancel := context.WithCancel(context.Background())
-		wake := make(chan struct{}, 1)
-		done := make(chan struct{})
-		r.wake, r.cancel, r.done = wake, cancel, done
-		go r.refreshLoop(ctx, wake, done)
-		r.queueAllRefreshLocked()
-		r.log("info", "quota router refresh worker started", map[string]any{
-			"cutoff_percent_used": cfg.CutoffPercentUsed,
-			"protected_models":    cfg.ProtectedModels,
-			"minimum_refresh_age": cfg.PollInterval.String(),
-			"request_timeout":     cfg.RequestTimeout.String(),
-		})
-		return
+	if r.cancel != nil {
+		if previous.Enabled && previous.PollInterval == cfg.PollInterval {
+			r.log("info", "quota balancer reconfigured", fields)
+			return
+		}
+		// Restart so a changed poll interval takes effect at once.
+		r.stopLocked()
 	}
-	if r.cache.empty() {
-		r.queueAllRefreshLocked()
-	}
-	r.log("info", "quota router configuration reloaded", map[string]any{
-		"cutoff_percent_used": cfg.CutoffPercentUsed,
-		"protected_models":    cfg.ProtectedModels,
-		"minimum_refresh_age": cfg.PollInterval.String(),
-		"request_timeout":     cfg.RequestTimeout.String(),
-	})
+	ctx, cancel := context.WithCancel(context.Background())
+	r.wake, r.cancel, r.done = make(chan struct{}, 1), cancel, make(chan struct{})
+	go r.refreshLoop(ctx, cfg.PollInterval, r.wake, r.done)
+	r.log("info", "quota balancer started", fields)
 }
 
 func (r *pluginRuntime) shutdown() {
@@ -108,247 +116,68 @@ func (r *pluginRuntime) stopLocked() {
 	if r.cancel == nil {
 		return
 	}
-	cancel, done := r.cancel, r.done
-	cancel()
-	if done != nil {
-		<-done
-	}
+	r.cancel()
+	<-r.done
 	r.wake, r.cancel, r.done = nil, nil, nil
-	r.refreshMu.Lock()
-	r.pendingAll, r.inFlightAll = false, false
-	clear(r.pendingIDs)
-	clear(r.inFlightIDs)
-	r.notifyRefreshLocked()
-	r.refreshMu.Unlock()
-	r.log("info", "quota router refresh worker stopped", nil)
 }
 
-func (r *pluginRuntime) loadedConfig() pluginConfig {
-	if r == nil {
-		return defaultPluginConfig()
-	}
-	if cfg := r.config.Load(); cfg != nil {
-		return *cfg
-	}
-	return defaultPluginConfig()
-}
-
-func (r *pluginRuntime) queueAllRefreshLocked() {
-	if r.wake == nil {
-		return
-	}
-	r.refreshMu.Lock()
-	r.pendingAll = true
-	clear(r.pendingIDs)
-	wake := r.wake
-	r.refreshMu.Unlock()
-	select {
-	case wake <- struct{}{}:
-	default:
-	}
-}
-
-func (r *pluginRuntime) queueCandidateRefresh(authID string, cfg pluginConfig, now time.Time) {
-	authID = strings.TrimSpace(authID)
-	if authID == "" {
-		return
-	}
+// requestRefresh asks the worker for an extra pass now; passes skip accounts
+// read within minimumRefreshGap.
+func (r *pluginRuntime) requestRefresh() {
 	r.lifecycleMu.Lock()
-	defer r.lifecycleMu.Unlock()
-	if r.wake == nil || r.cancel == nil || !r.loadedConfig().Enabled {
-		return
-	}
-	r.refreshMu.Lock()
-	if r.pendingAll || r.inFlightAll {
-		r.refreshMu.Unlock()
-		return
-	}
-	if _, exists := r.pendingIDs[authID]; exists {
-		r.refreshMu.Unlock()
-		return
-	}
-	if _, exists := r.inFlightIDs[authID]; exists {
-		r.refreshMu.Unlock()
-		return
-	}
-	if !r.cache.claimRefresh(authID, now, cfg.CutoffPercentUsed, cfg.PollInterval, cfg.BlockedRefreshInterval) {
-		r.refreshMu.Unlock()
-		return
-	}
-	if r.pendingIDs == nil {
-		r.pendingIDs = make(map[string]struct{})
-	}
-	r.pendingIDs[authID] = struct{}{}
 	wake := r.wake
-	r.refreshMu.Unlock()
+	r.lifecycleMu.Unlock()
+	if wake == nil {
+		return
+	}
 	select {
 	case wake <- struct{}{}:
 	default:
 	}
 }
 
-// Owner policy: when no normally eligible seat exists, selection waits for a
-// bounded fresh read of reset-pending seats through the same worker/fetch path.
-// Queueing still obeys post-failure retry age; an existing pending/in-flight
-// refresh is joined, never duplicated. A wait timeout alone is NOT an outage.
-func (r *pluginRuntime) waitResetPending(authIDs []string, cfg pluginConfig, now time.Time) {
-	ctx, cancel := context.WithTimeout(context.Background(), resetReadTimeout(cfg))
-	defer cancel()
-	for _, authID := range authIDs {
-		r.queueCandidateRefresh(authID, cfg, now)
-	}
-	for {
-		r.refreshMu.Lock()
-		changed := r.refreshChanged
-		active := r.pendingAll || r.inFlightAll
-		for _, authID := range authIDs {
-			_, pending := r.pendingIDs[authID]
-			_, inFlight := r.inFlightIDs[authID]
-			active = active || pending || inFlight
-		}
-		r.refreshMu.Unlock()
-		if !active {
-			return
-		}
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func resetReadTimeout(cfg pluginConfig) time.Duration {
-	return min(cfg.RequestTimeout, 2*time.Second)
-}
-
-// Report only safe categories for the fail-closed post-reset no-seat error.
-// Empty means the seat is no longer reset-pending (e.g. a fresh exhausted read).
-// Incomplete work is not evidence of a host outage, but still cannot enable it.
-func (r *pluginRuntime) resetPendingFailure(authID string, now time.Time, cutoff float64) string {
-	r.refreshMu.Lock()
-	defer r.refreshMu.Unlock()
-	_, pending := r.pendingIDs[authID]
-	_, inFlight := r.inFlightIDs[authID]
-	sample := r.cache.snapshot(authID)
-	if !sample.resetPending(now, cutoff) {
-		return ""
-	}
-	if r.pendingAll || r.inFlightAll || pending || inFlight {
-		return "read_pending"
-	}
-	if sample.LastAttemptAt.Before(sample.ResetAt) {
-		return "unverified"
-	}
-	switch sample.LastErrorCategory {
-	case pollErrorAuthList, pollErrorAuthGet, pollErrorTimeout, pollErrorNetwork,
-		pollErrorUnauthorized, pollErrorForbidden, pollErrorRateLimited,
-		pollErrorServer, pollErrorHTTP, pollErrorRead, pollErrorInvalidJSON,
-		pollErrorInvalidWeekly, pollErrorBodyTooLarge, pollErrorMissingToken, pollErrorCancelled,
-		pollErrorInvalidCredential:
-		return sample.LastErrorCategory
-	default:
-		return "unverified"
-	}
-}
-
-func (r *pluginRuntime) notifyRefreshLocked() {
-	close(r.refreshChanged)
-	r.refreshChanged = make(chan struct{})
-}
-
-func (r *pluginRuntime) refreshLoop(ctx context.Context, wake <-chan struct{}, done chan<- struct{}) {
+func (r *pluginRuntime) refreshLoop(ctx context.Context, interval time.Duration, wake <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	r.refreshAll(ctx, false)
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			r.refreshAll(ctx, false)
 		case <-wake:
-		}
-		for {
-			all, authIDs := r.takePendingRefresh()
-			if !all && len(authIDs) == 0 {
-				break
-			}
-			cfg := r.loadedConfig()
-			if cfg.Enabled {
-				r.refreshAuths(ctx, cfg, all, authIDs)
-			}
-			r.finishRefresh(all, authIDs)
-			if ctx.Err() != nil {
-				return
-			}
+			r.refreshAll(ctx, true)
 		}
 	}
 }
 
-func (r *pluginRuntime) takePendingRefresh() (bool, map[string]struct{}) {
-	r.refreshMu.Lock()
-	defer r.refreshMu.Unlock()
-	if r.pendingAll {
-		r.pendingAll = false
-		clear(r.pendingIDs)
-		r.inFlightAll = true
-		return true, nil
-	}
-	if len(r.pendingIDs) == 0 {
-		return false, nil
-	}
-	authIDs := r.pendingIDs
-	r.pendingIDs = make(map[string]struct{})
-	if r.inFlightIDs == nil {
-		r.inFlightIDs = make(map[string]struct{}, len(authIDs))
-	}
-	for authID := range authIDs {
-		r.inFlightIDs[authID] = struct{}{}
-	}
-	return false, authIDs
-}
-
-func (r *pluginRuntime) finishRefresh(all bool, authIDs map[string]struct{}) {
-	r.refreshMu.Lock()
-	defer r.refreshMu.Unlock()
-	defer r.notifyRefreshLocked()
-	if all {
-		r.inFlightAll = false
-		return
-	}
-	for authID := range authIDs {
-		delete(r.inFlightIDs, authID)
-	}
-}
-
-func (r *pluginRuntime) pollOnce(ctx context.Context, cfg pluginConfig) {
-	r.refreshAuths(ctx, cfg, true, nil)
-}
-
-func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all bool, authIDs map[string]struct{}) {
-	if r == nil || r.host == nil || r.fetch == nil || ctx.Err() != nil {
+func (r *pluginRuntime) refreshAll(ctx context.Context, onDemand bool) {
+	defer func() {
+		select {
+		case r.polled <- struct{}{}:
+		default:
+		}
+	}()
+	if r.host == nil || r.fetch == nil || ctx.Err() != nil {
 		return
 	}
 	entries, err := r.host.listAuth()
 	if err != nil {
-		if all {
-			authIDs = make(map[string]struct{})
-			for _, account := range r.cache.statuses(r.now(), cfg.CutoffPercentUsed) {
-				authIDs[account.ID] = struct{}{}
-			}
-		}
-		for authID := range authIDs {
-			r.cache.recordAttempt(authID, r.now())
-			r.cache.recordFailure(authID, pollErrorAuthList)
-		}
-		r.log("warn", "quota router auth discovery failed", map[string]any{"category": pollErrorAuthList})
+		r.log("warn", "quota balancer auth discovery failed", map[string]any{"category": pollErrorAuthList})
 		return
 	}
 	auths := physicalClaudeAuths(entries)
 	r.cache.reconcile(auths)
+	cfg := r.loadedConfig()
 	for _, auth := range auths {
 		if ctx.Err() != nil {
 			return
 		}
-		if !all {
-			if _, selected := authIDs[auth.ID]; !selected {
+		if onDemand {
+			sample, _ := r.cache.snapshot(auth.ID)
+			if sample.HasSample && !sample.refused() && r.now().Sub(sample.LastAttemptAt) < minimumRefreshGap {
 				continue
 			}
 		}
@@ -357,30 +186,20 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 }
 
 func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
-	if r.cache.snapshot(auth.ID).resetPending(r.now(), cfg.CutoffPercentUsed) {
-		// Bound the fresh fetch too; pick's separate deadline also bounds a
-		// blocked host callback (the host API itself has no context argument).
-		cfg.RequestTimeout = resetReadTimeout(cfg)
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, cfg.RequestTimeout)
-		defer cancel()
-	}
 	r.cache.recordAttempt(auth.ID, r.now())
 	rawAuth, err := r.host.getAuth(auth.AuthIndex)
 	if err != nil {
-		r.recordPollFailure(auth.ID, pollErrorAuthGet)
+		r.recordPollFailure(auth, pollErrorAuthGet)
 		return
 	}
 	var credential claudeCredential
-	// A successful host callback can still return an invalid local file.
-	// Decode/type validation failures are not host outages.
 	if json.Unmarshal(rawAuth, &credential) != nil || !strings.EqualFold(strings.TrimSpace(credential.Type), "claude") {
-		r.recordPollFailure(auth.ID, pollErrorInvalidCredential)
+		r.recordPollFailure(auth, pollErrorInvalidCredential)
 		return
 	}
 	token := strings.TrimSpace(credential.AccessToken)
 	if token == "" {
-		r.recordPollFailure(auth.ID, pollErrorMissingToken)
+		r.recordPollFailure(auth, pollErrorMissingToken)
 		return
 	}
 	result, category := r.fetch(ctx, token, cfg.RequestTimeout)
@@ -389,22 +208,22 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 			category = pollErrorTimeout
 		}
 		if category != pollErrorCancelled || ctx.Err() == nil {
-			r.recordPollFailure(auth.ID, category)
+			r.recordPollFailure(auth, category)
 		}
 		return
 	}
-	r.cache.recordSuccess(auth.ID, result.WeeklyPercentUsed, result.ResetAt, r.now())
-	r.log("debug", "quota router quota refreshed", map[string]any{
-		"auth_id":             auth.ID,
-		"weekly_percent_used": result.WeeklyPercentUsed,
-		"blocked":             result.WeeklyPercentUsed >= cfg.CutoffPercentUsed,
+	r.cache.recordPoll(auth.ID, result, r.now())
+	r.log("debug", "quota balancer usage read", map[string]any{
+		"auth_id":   auth.ID,
+		"five_hour": result.FiveHour.Used,
+		"weekly":    result.Weekly.Used,
 	})
 }
 
-func (r *pluginRuntime) recordPollFailure(authID, category string) {
-	r.cache.recordFailure(authID, category)
-	r.log("warn", "quota router quota refresh failed", map[string]any{
-		"auth_id":  authID,
+func (r *pluginRuntime) recordPollFailure(auth physicalClaudeAuth, category string) {
+	r.cache.recordFailure(auth.ID, category)
+	r.log("warn", "quota balancer usage read failed", map[string]any{
+		"auth_id":  auth.ID,
 		"category": category,
 	})
 }

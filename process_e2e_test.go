@@ -27,6 +27,9 @@ const (
 
 var e2eUsageHits atomic.Int64
 
+// TestCLIProxyAPIProcessEndToEnd loads the built plugin into a real CLIProxyAPI.
+// Set CLIPROXYAPI_SRC to a host checkout (e.g. v8) to test against that host
+// instead of the module this plugin builds against.
 func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e2eUsageHits.Add(1)
@@ -34,17 +37,17 @@ func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 			http.Error(w, "missing beta header", http.StatusBadRequest)
 			return
 		}
-		utilization := 0
+		weekly := 0
 		switch strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") {
 		case "e2e-token-a":
-			utilization = 52
+			weekly = 80
 		case "e2e-token-b":
-			utilization = 80
+			weekly = 20
 		default:
 			http.Error(w, "unknown token", http.StatusUnauthorized)
 			return
 		}
-		_, _ = fmt.Fprintf(w, `{"seven_day":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"}}`, utilization)
+		_, _ = fmt.Fprintf(w, `{"five_hour":{"utilization":10,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"}}`, weekly)
 	}))
 	defer usageServer.Close()
 
@@ -59,7 +62,10 @@ func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 	defer proxyServer.Close()
 
 	dir := t.TempDir()
-	root := cliProxyAPIModuleDir(t)
+	root := os.Getenv("CLIPROXYAPI_SRC")
+	if root == "" {
+		root = cliProxyAPIModuleDir(t)
+	}
 	pluginDir, authDir := filepath.Join(dir, "plugins"), filepath.Join(dir, "auth")
 	if err := os.MkdirAll(pluginDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -76,13 +82,14 @@ func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 		extension, serverName = ".dll", "cliproxyapi.exe"
 	}
 	pluginPath := filepath.Join(pluginDir, pluginName+extension)
-	buildPlugin := exec.Command("go", "build", "-buildmode=c-shared", "-ldflags", "-X=main.usageEndpoint="+usageServer.URL, "-o", pluginPath, ".")
+	buildPlugin := exec.Command("go", "build", "-buildmode=c-shared", "-ldflags",
+		"-X=main.usageEndpoint="+usageServer.URL+" -X=main.e2eShortIntervals=true", "-o", pluginPath, ".")
 	if output, errBuild := buildPlugin.CombinedOutput(); errBuild != nil {
 		t.Fatalf("build plugin: %v\n%s", errBuild, output)
 	}
 
 	serverPath := filepath.Join(dir, serverName)
-	buildServer := exec.Command("go", "build", "-o", serverPath, "./cmd/server")
+	buildServer := exec.Command("go", "build", "-buildvcs=false", "-o", serverPath, "./cmd/server")
 	buildServer.Dir = root
 	if output, errBuild := buildServer.CombinedOutput(); errBuild != nil {
 		t.Fatalf("build CLIProxyAPI: %v\n%s", errBuild, output)
@@ -120,12 +127,12 @@ plugins:
   enabled: true
   dir: %q
   configs:
-    quota-router:
+    quota-balancer:
       enabled: true
       priority: 100
-      protected-models: [claude-fable-5]
-      cutoff-percent-used: 50
-      poll-interval: 50ms
+      five-hour-ceiling: 90
+      weekly-ceiling: 90
+      poll-interval: 100ms
       request-timeout: 1s
 `, port, proxyServer.URL, authDir, e2eAPIKey, e2eManagementKey, pluginDir)
 	if err := os.WriteFile(configPath, []byte(configYAML), 0o600); err != nil {
@@ -167,30 +174,25 @@ plugins:
 
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	client := &http.Client{Timeout: 2 * time.Second}
-	status := waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
-		if !status.Enabled || len(status.ProtectedModels) != 1 || status.ProtectedModels[0] != defaultProtectedModel || status.CutoffPercentUsed != 50 || len(status.Accounts) != 2 {
-			return false
-		}
+	accountByEmail := func(status statusResponse, email string) accountView {
 		for _, account := range status.Accounts {
-			if !account.Known || !account.Blocked {
-				return false
+			if account.Email == email {
+				return account
 			}
 		}
-		return true
+		return accountView{}
+	}
+	waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status statusResponse) bool {
+		return len(status.Accounts) == 2 &&
+			accountByEmail(status, "e2e-0@example.com").Eligible && accountByEmail(status, "e2e-0@example.com").Weekly == 80 &&
+			accountByEmail(status, "e2e-1@example.com").Eligible && accountByEmail(status, "e2e-1@example.com").Weekly == 20
 	})
-	if len(status.Accounts) != 2 {
-		t.Fatalf("initial status = %#v", status)
-	}
-	startupUsageHits := e2eUsageHits.Load()
-	time.Sleep(250 * time.Millisecond)
-	if hits := e2eUsageHits.Load(); hits != startupUsageHits {
-		t.Fatalf("idle worker refreshed usage: hits=%d, want %d", hits, startupUsageHits)
-	}
-	waitForProcessModel(t, client, baseURL, processDone, &processErr, logPath, "claude-sonnet-4-6")
+	model := waitForProcessClaudeModel(t, client, baseURL, processDone, &processErr, logPath)
 
-	unprotectedResponse := postClaudeMessage(t, client, baseURL, "claude-sonnet-4-6")
-	if bytes.Contains(unprotectedResponse, []byte(exhaustedErrorCode)) {
-		t.Fatalf("unprotected request was cutoff-blocked: %s", unprotectedResponse)
+	// A new conversation lands on the account with the most headroom (b: 70 vs a: 10).
+	routed := postClaudeMessage(t, client, baseURL, model, "e2e-session")
+	if bytes.Contains(routed, []byte(exhaustedErrorCode)) {
+		t.Fatalf("eligible request was refused: %s\nserver log:\n%s", routed, readLog(logPath))
 	}
 	select {
 	case hit := <-proxyHits:
@@ -198,7 +200,15 @@ plugins:
 			t.Fatalf("unexpected upstream proxy target: %s", hit)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatalf("unprotected request never reached upstream proxy: %s\nserver log:\n%s", unprotectedResponse, readLog(logPath))
+		t.Fatalf("request never reached upstream proxy: %s\nserver log:\n%s", routed, readLog(logPath))
+	}
+	// The fixture proxy fails every upstream call, so the host retries on the
+	// other account; the first attempt shows which account the plugin chose.
+	// Older hosts do not log the attempt's auth file; v8 does.
+	if first := firstUpstreamAuthFile(readLog(logPath)); first == "" {
+		t.Log("host does not log upstream attempts; skipping the chosen-account check")
+	} else if first != "claude-b.json" {
+		t.Fatalf("first upstream attempt used %q, want claude-b.json (most headroom)\nserver log:\n%s", first, readLog(logPath))
 	}
 drainProxyHits:
 	for {
@@ -209,36 +219,41 @@ drainProxyHits:
 			break drainProxyHits
 		}
 	}
-	if hits := e2eUsageHits.Load(); hits != startupUsageHits {
-		t.Fatalf("unprotected request refreshed usage: hits=%d, want %d", hits, startupUsageHits)
-	}
-	waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
-		if len(status.Accounts) != 2 {
-			return false
-		}
-		for _, account := range status.Accounts {
-			if !account.Known || !account.Blocked {
-				return false
-			}
-		}
-		return true
-	})
 
-	blockedResponse := postClaudeMessage(t, client, baseURL, defaultProtectedModel)
-	if !bytes.Contains(blockedResponse, []byte(exhaustedErrorCode)) {
-		t.Fatalf("protected request did not return cutoff error: %s\nserver log:\n%s", blockedResponse, readLog(logPath))
+	// Lower the weekly ceiling under both accounts: nothing may be routed.
+	patchPluginConfig(t, client, baseURL, `{"weekly-ceiling":15}`)
+	waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status statusResponse) bool {
+		return status.Default.Weekly == 15 && len(status.Accounts) == 2 &&
+			!status.Accounts[0].Eligible && !status.Accounts[1].Eligible
+	})
+	refused := postClaudeMessage(t, client, baseURL, model, "e2e-session")
+	if !bytes.Contains(refused, []byte("no Claude account is under its usage ceiling")) {
+		t.Fatalf("request over every ceiling was not refused: %s\nserver log:\n%s", refused, readLog(logPath))
 	}
 	select {
 	case hit := <-proxyHits:
-		t.Fatalf("protected request reached upstream proxy: %s", hit)
-	default:
+		t.Fatalf("refused request reached upstream proxy: %s", hit)
+	case <-time.After(300 * time.Millisecond):
 	}
-	if hits := e2eUsageHits.Load(); hits != startupUsageHits {
-		t.Fatalf("blocked request refreshed usage before reset: hits=%d, want %d", hits, startupUsageHits)
+	if e2eUsageHits.Load() == 0 {
+		t.Fatalf("usage endpoint was never read")
 	}
+}
 
-	patch := []byte(`{"cutoff-percent-used":90}`)
-	request, err := http.NewRequest(http.MethodPatch, baseURL+"/v0/management/plugins/"+pluginName+"/config", bytes.NewReader(patch))
+func firstUpstreamAuthFile(log string) string {
+	for _, line := range strings.Split(log, "\n") {
+		if _, rest, ok := strings.Cut(line, "upstream execution failed:"); ok {
+			if _, file, ok := strings.Cut(rest, "auth_file="); ok {
+				return strings.Fields(file)[0]
+			}
+		}
+	}
+	return ""
+}
+
+func patchPluginConfig(t *testing.T, client *http.Client, baseURL, patch string) {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPatch, baseURL+"/v0/management/plugins/"+pluginName+"/config", strings.NewReader(patch))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,36 +263,41 @@ drainProxyHits:
 	if err != nil {
 		t.Fatal(err)
 	}
-	responseBody := readResponseBody(t, response)
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("patch plugin config: status=%d body=%s", response.StatusCode, responseBody)
+	if body := readResponseBody(t, response); response.StatusCode != http.StatusOK {
+		t.Fatalf("patch plugin config: status=%d body=%s", response.StatusCode, body)
 	}
+}
 
-	waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
-		if status.CutoffPercentUsed != 90 || len(status.Accounts) != 2 {
-			return false
+func waitForProcessClaudeModel(t *testing.T, client *http.Client, baseURL string, processDone <-chan struct{}, processErr *error, logPath string) string {
+	t.Helper()
+	deadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-processDone:
+			t.Fatalf("CLIProxyAPI exited before model registration: %v\n%s", *processErr, readLog(logPath))
+		default:
 		}
-		for _, account := range status.Accounts {
-			if !account.Known || account.Blocked {
-				return false
+		request, _ := http.NewRequest(http.MethodGet, baseURL+"/v1/models", nil)
+		request.Header.Set("Authorization", "Bearer "+e2eAPIKey)
+		if response, err := client.Do(request); err == nil {
+			var models struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			body := readResponseBody(t, response)
+			if response.StatusCode == http.StatusOK && json.Unmarshal(body, &models) == nil {
+				for _, m := range models.Data {
+					if strings.HasPrefix(m.ID, "claude-") {
+						return m.ID
+					}
+				}
 			}
 		}
-		return true
-	})
-
-	eligibleResponse := postClaudeMessage(t, client, baseURL, defaultProtectedModel)
-	if bytes.Contains(eligibleResponse, []byte(exhaustedErrorCode)) {
-		t.Fatalf("eligible request remained cutoff-blocked: %s", eligibleResponse)
+		time.Sleep(25 * time.Millisecond)
 	}
-	select {
-	case hit := <-proxyHits:
-		if !strings.Contains(hit, "api.anthropic.com:443") {
-			t.Fatalf("unexpected upstream proxy target: %s", hit)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("eligible request never reached upstream proxy: %s\nserver log:\n%s", eligibleResponse, readLog(logPath))
-	}
-	waitFor(t, func() bool { return e2eUsageHits.Load() > startupUsageHits })
+	t.Fatalf("no Claude model was registered\n%s", readLog(logPath))
+	return ""
 }
 
 func cliProxyAPIModuleDir(t *testing.T) string {
@@ -301,7 +321,7 @@ func unusedTCPPort(t *testing.T) int {
 	return port
 }
 
-func waitForProcessStatus(t *testing.T, client *http.Client, baseURL string, processDone <-chan struct{}, processErr *error, logPath string, ready func(cutoffStatusResponse) bool) cutoffStatusResponse {
+func waitForProcessStatus(t *testing.T, client *http.Client, baseURL string, processDone <-chan struct{}, processErr *error, logPath string, ready func(statusResponse) bool) statusResponse {
 	t.Helper()
 	deadline := time.Now().Add(12 * time.Second)
 	for time.Now().Before(deadline) {
@@ -314,7 +334,7 @@ func waitForProcessStatus(t *testing.T, client *http.Client, baseURL string, pro
 		request.Header.Set("Authorization", "Bearer "+e2eManagementKey)
 		response, err := client.Do(request)
 		if err == nil {
-			var status cutoffStatusResponse
+			var status statusResponse
 			body := readResponseBody(t, response)
 			if response.StatusCode == http.StatusOK && json.Unmarshal(body, &status) == nil && ready(status) {
 				return status
@@ -323,32 +343,9 @@ func waitForProcessStatus(t *testing.T, client *http.Client, baseURL string, pro
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("CLIProxyAPI status did not converge\n%s", readLog(logPath))
-	return cutoffStatusResponse{}
+	return statusResponse{}
 }
-func waitForProcessModel(t *testing.T, client *http.Client, baseURL string, processDone <-chan struct{}, processErr *error, logPath, model string) {
-	t.Helper()
-	deadline := time.Now().Add(12 * time.Second)
-	for time.Now().Before(deadline) {
-		select {
-		case <-processDone:
-			t.Fatalf("CLIProxyAPI exited before model registration: %v\n%s", *processErr, readLog(logPath))
-		default:
-		}
-		request, _ := http.NewRequest(http.MethodGet, baseURL+"/v1/models", nil)
-		request.Header.Set("Authorization", "Bearer "+e2eAPIKey)
-		response, err := client.Do(request)
-		if err == nil {
-			body := readResponseBody(t, response)
-			if response.StatusCode == http.StatusOK && bytes.Contains(body, []byte(model)) {
-				return
-			}
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	t.Fatalf("CLIProxyAPI model %q was not registered\n%s", model, readLog(logPath))
-}
-
-func postClaudeMessage(t *testing.T, client *http.Client, baseURL, model string) []byte {
+func postClaudeMessage(t *testing.T, client *http.Client, baseURL, model, session string) []byte {
 	t.Helper()
 	body := []byte(fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"role":"user","content":"ping"}]}`, model))
 	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, baseURL+"/v1/messages", bytes.NewReader(body))
@@ -358,6 +355,7 @@ func postClaudeMessage(t *testing.T, client *http.Client, baseURL, model string)
 	request.Header.Set("Authorization", "Bearer "+e2eAPIKey)
 	request.Header.Set("Anthropic-Version", "2023-06-01")
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Claude-Code-Session-Id", session)
 	response, err := client.Do(request)
 	if err != nil {
 		t.Fatal(err)

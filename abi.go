@@ -132,6 +132,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return errorEnvelope(decisionError.Code, decisionError.Message), nil
 		}
 		return okEnvelope(response)
+	case pluginabi.MethodUsageHandle:
+		var record usageRecord
+		if err := json.Unmarshal(request, &record); err != nil {
+			return nil, fmt.Errorf("decode usage record: %w", err)
+		}
+		activeRuntime.handleUsage(record)
+		return okEnvelope(struct{}{})
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistration())
 	case pluginabi.MethodManagementHandle:

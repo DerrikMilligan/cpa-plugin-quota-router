@@ -1,74 +1,97 @@
-# CLIProxyAPI Quota Router
+# CLIProxyAPI Quota Balancer
 
-Quota-aware account routing for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). The plugin routes configured protected models away from OAuth accounts when provider usage reaches a configurable cutoff, while leaving other models on CLIProxyAPI's native scheduler. This release supports Anthropic's seven-day usage quota; the provider-specific usage adapter can expand when another provider exposes equivalent data.
+A CLIProxyAPI scheduler plugin that spreads Claude traffic evenly across OAuth
+accounts and never routes to an account at or above its usage ceiling on
+either Anthropic window: the 5-hour session window or the weekly window.
 
-The default specifically protects `claude-fable-5` at 50%. This matches Anthropic's [June 30 redeployment announcement](https://www.anthropic.com/news/redeploying-fable-5), which included Fable 5 for up to 50% of weekly usage through July 7, 2026; Anthropic said access would use usage credits afterward, so both the model and cutoff remain configurable.
+Forked from [Smarty-Pants-Inc/cpa-plugin-quota-router](https://github.com/Smarty-Pants-Inc/cpa-plugin-quota-router)
+(MIT), which blocked one weekly cutoff for an explicit model list. This fork
+reads both windows, routes every Claude model by default, balances by
+headroom, keeps conversations on one account for the prompt cache, and takes
+per-account ceilings.
 
-## Install
+## How it picks
 
-Download the archive for your platform from [Releases](https://github.com/Smarty-Pants-Inc/cpa-plugin-quota-router/releases), extract the library into CLIProxyAPI's plugin directory, and configure it by plugin ID:
+Each account's **headroom** is the smaller of its two windows' points left
+under the ceiling:
+
+    headroom = min(5h ceiling - 5h used, weekly ceiling - weekly used)
+
+An account with 50% weekly left scores 40 at a 90% ceiling; one with 80% left
+scores 70 and takes the traffic. Feeding the account with the most room pulls
+every account toward the same remaining usage.
+
+- **Ceilings are hard.** An account at or above either ceiling, refused
+  upstream, or without a reading newer than `max-staleness` takes no request.
+  When no account qualifies the request fails with a message naming each
+  account's reason, rather than going over.
+- **New conversations** go to the account with the most headroom. Accounts
+  within `spread-band` points of the best count as equal, and the one carrying
+  the fewest live conversations, then the one picked longest ago, takes it.
+- **Conversations stick** to their account (keyed on `X-Claude-Code-Session-Id`
+  or the other session headers the host recognises, per model) so the prompt
+  cache stays warm. A conversation moves on its next request once its account
+  reaches a ceiling, or once another account has `rebalance-margin` more
+  points of headroom. Moving costs one cold prompt cache.
+- **Readings** come from Anthropic's usage endpoint every `poll-interval`, and
+  from the rate-limit headers on every proxied response in between, so the
+  account carrying traffic updates continuously. A `rejected` window status or
+  an upstream 429 blocks the account until a fresh read.
+
+Overshoot is bounded, not zero: requests already in flight when an account
+crosses its ceiling still complete. Leave a little room in the ceiling for that.
+
+## Configuration
 
 ```yaml
 plugins:
   enabled: true
   configs:
-    quota-router:
+    quota-balancer:
       enabled: true
-      priority: 100
-      protected-models: [claude-fable-5]
-      cutoff-percent-used: 50
-      poll-interval: 5m
-      blocked-refresh-interval: 6h
+      models: ["*"]              # Claude model IDs routed; "*" or empty = all
+      five-hour-ceiling: 90      # percent used
+      weekly-ceiling: 90         # percent used
+      accounts:                  # per-account ceilings, keyed by email or auth file name
+        someone@example.com:
+          five-hour-ceiling: 60  # unset fields inherit the defaults
+      spread-band: 10            # headroom points treated as a tie
+      rebalance-margin: 25       # headroom gap that moves a live conversation
+      affinity-ttl: 1h           # idle time before a conversation binding expires
+      poll-interval: 2m          # usage endpoint cadence (minimum 30s)
+      max-staleness: 10m         # older readings make an account ineligible (>= 2x poll-interval)
       request-timeout: 10s
 ```
 
-The library basename must be `quota-router` or a semver-suffixed form such as `quota-router-v0.5.0`, with `.dylib`, `.so`, or `.dll` for the host platform.
+Status: `GET /v0/management/plugins/quota-balancer/status` (management key)
+lists each account's usage, ceilings, headroom, eligibility and live
+conversations.
 
-Published releases include Darwin (`amd64`, `arm64`), Linux (`amd64`, `arm64`), and Windows (`amd64`) builds.
+## Install
 
-`poll-interval` is the minimum cached-usage age before another refresh, not a continuous polling timer.
+Build with Go 1.26 and a C toolchain:
 
-## Configuration
+```sh
+make build            # dist/quota-balancer.so
+```
 
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `protected-models` | `[claude-fable-5]` | Exact, case-insensitive model IDs governed by the cutoff. |
-| `cutoff-percent-used` | `50` | Blocks an eligible account at or above this seven-day utilization percentage. |
-| `poll-interval` | `5m` | Minimum cache age before a protected request queues another refresh; a passed reset allows an immediate first-use refresh, with failed post-reset retries throttled from the attempt. |
-| `blocked-refresh-interval` | `6h` | Minimum time since the last sample or refresh attempt before a protected request rechecks a blocked account. `0` disables this backstop. |
-| `request-timeout` | `10s` | Timeout for the provider usage request, expressed as a Go duration. |
+Copy the library into CLIProxyAPI's plugin directory (`plugins/<goos>/<goarch>/`
+under the host's working directory by default) and add the config block.
+Requires CLIProxyAPI with the plugin ABI (v7.2.100+); the usage-header feed is
+verified on v8.0.19.
 
-## Behavior
+## Tests
 
-- Refreshes enabled physical Claude OAuth credentials when the worker starts; startup reconfiguration retries discovery only while the cache is empty. There is no time-driven polling.
-- When a protected-model request selects an account whose cached usage is at least `poll-interval` old, queues one asynchronous refresh for that account while routing the current request from memory.
-- Coalesces concurrent refreshes. A blocked account remains excluded before its reported reset, but protected requests queue a re-read after `blocked-refresh-interval` since its last sample or refresh attempt. This backstop can detect an early provider reset; it is not a continuous polling timer.
-- A rejection-only design cannot enforce a pre-exhaustion cutoff: the rejection arrives only after the hard limit is reached.
-- Applies only to exact, case-insensitive `protected-models` matches.
-- Blocks an account at or above `cutoff-percent-used`. Truly unknown quota state retains the existing fail-open policy, but an exhausted pre-reset sample becomes **reset-pending**, not eligible, when its reset passes. First use queues a reread even if the pre-reset sample is younger than `poll-interval`; subsequent failed attempts remain rate-limited. Status reports reset-pending accounts as unknown but blocked.
-- Normally eligible accounts are selected without waiting for reset-pending accounts. If none are available, selection synchronously queues or joins the existing coalesced worker reread, waiting at most `min(request-timeout, 2s)` for all reset-pending candidates. Only a successful reread below the cutoff enables the seat. A fresh exhausted reading remains blocked, even if its reported reset is already past; the blocked-refresh backstop can retry it later.
-- **No quota-host outage fallback:** if every candidate remains reset-pending and no successful below-cutoff fresh read is available, fail closed through the existing no-seat error envelope (`quota_router_exhausted`), with message `no verified seat: all candidate seats await a post-reset quota read; quota host error: <safe category>`. Emit one decision WARN per pick, naming the seats and safe categories (multiple categories are sorted; unfinished reads use `read_pending`, and absent/unrecognized errors use `unverified`). Malformed or type-invalid local credential JSON is categorized as `invalid local credential`, never as a host outage (`auth_get`); this safe local category is also included in the no-seat error. Existing worker refresh-failure logs remain separate. Cached blocks are retained, and failed retries remain throttled; once the host recovers, the next retry-eligible pick can select a seat only after a successful below-cutoff read. All seats being reset-pending at once while the quota host is down is a narrow window because accounts reset at different times, and an unverified post-reset seat must never be used. An unfinished reread, unusable local credential, cancellation, or fresh exhausted result never enables a seat.
-- Never changes auth files or CLIProxyAPI's permanent disabled state.
-- Exposes authenticated status at `GET /v0/management/plugins/quota-router/status`.
+```sh
+make test                                   # unit + ABI + end-to-end against the v7 module
+CLIPROXYAPI_SRC=/path/to/CLIProxyAPI go test ./...   # end-to-end against another host checkout
+```
 
 ## Security
 
-- Reads eligible Claude credentials through CLIProxyAPI's host API and never writes auth files.
-- Sends the access token only to Anthropic's fixed HTTPS usage endpoint and refuses redirects.
-- Never logs access tokens, refresh tokens, or provider response bodies.
-- Exposes status only through CLIProxyAPI's authenticated Management API.
+The access token goes only to Anthropic's fixed HTTPS usage endpoint, with
+redirects refused. Tokens and provider response bodies are never logged.
 
-## Build and test
+## License
 
-Requires Go 1.26 and CLIProxyAPI v7.2.100 or newer.
-
-```bash
-make test
-make test-race
-make vet
-make build
-```
-
-Release tags matching `v*` build store-compatible archives and `checksums.txt` through GitHub Actions.
-
-Created and published by [Smarty Pants Inc](https://github.com/Smarty-Pants-Inc). MIT licensed.
+MIT, as upstream.

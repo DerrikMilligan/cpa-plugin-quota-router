@@ -11,9 +11,15 @@ import (
 	"time"
 )
 
+// windowReading is one rate-limit window: percent used (0-100) and when it resets.
+type windowReading struct {
+	Used    float64
+	ResetAt time.Time
+}
+
 type usageResult struct {
-	WeeklyPercentUsed float64
-	ResetAt           time.Time
+	FiveHour windowReading
+	Weekly   windowReading
 }
 
 type usageFetcher func(context.Context, string, time.Duration) (usageResult, string)
@@ -39,6 +45,7 @@ func newHTTPUsageFetcher(endpoint string, transport http.RoundTripper) httpUsage
 }
 
 type usageResponse struct {
+	FiveHour *usageWindow `json:"five_hour"`
 	SevenDay *usageWindow `json:"seven_day"`
 }
 
@@ -107,21 +114,41 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 		return usageResult{}, pollErrorInvalidJSON
 	}
 	if payload.SevenDay == nil {
-		return usageResult{}, pollErrorInvalidWeekly
+		return usageResult{}, pollErrorInvalidWindow
 	}
-	percentUsed, ok := normalizeWeeklyPercent(payload.SevenDay.Utilization)
+	fiveHour, ok := parseWindow(payload.FiveHour)
 	if !ok {
-		return usageResult{}, pollErrorInvalidWeekly
+		return usageResult{}, pollErrorInvalidWindow
 	}
-	resetAt, ok := parseResetTime(payload.SevenDay.ResetsAt)
+	weekly, ok := parseWindow(payload.SevenDay)
 	if !ok {
-		return usageResult{}, pollErrorInvalidWeekly
+		return usageResult{}, pollErrorInvalidWindow
 	}
-	return usageResult{WeeklyPercentUsed: percentUsed, ResetAt: resetAt}, ""
+	return usageResult{FiveHour: fiveHour, Weekly: weekly}, ""
+}
+
+// parseWindow reads one usage-endpoint window. A missing window, or one with no
+// reset time, has not started since the last reset, so it reads 0.
+func parseWindow(window *usageWindow) (windowReading, bool) {
+	if window == nil {
+		return windowReading{}, true
+	}
+	used, ok := normalizePercent(window.Utilization)
+	if !ok {
+		return windowReading{}, false
+	}
+	resetAt, ok := parseResetTime(window.ResetsAt)
+	if !ok {
+		if len(window.ResetsAt) != 0 && string(window.ResetsAt) != "null" {
+			return windowReading{}, false
+		}
+		resetAt = time.Time{}
+	}
+	return windowReading{Used: used, ResetAt: resetAt}, true
 }
 
 // Anthropic reports percentage points: 1.0 means 1%, not 100%.
-func normalizeWeeklyPercent(raw *float64) (float64, bool) {
+func normalizePercent(raw *float64) (float64, bool) {
 	if raw == nil || math.IsNaN(*raw) || math.IsInf(*raw, 0) || *raw < 0 || *raw > 100 {
 		return 0, false
 	}

@@ -1,57 +1,51 @@
 package main
 
 import (
-	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
-type cutoffStatusResponse struct {
-	Enabled           bool                  `json:"enabled"`
-	ProtectedModels   []string              `json:"protected_models"`
-	CutoffPercentUsed float64               `json:"cutoff_percent_used"`
-	Accounts          []cutoffAccountStatus `json:"accounts"`
-}
-
-type cutoffAccountStatus struct {
-	ID                string   `json:"id"`
-	AuthIndex         string   `json:"auth_index,omitempty"`
-	Name              string   `json:"name,omitempty"`
-	Known             bool     `json:"known"`
-	Blocked           bool     `json:"blocked"`
-	WeeklyPercentUsed *float64 `json:"weekly_percent_used,omitempty"`
-	SampledAt         string   `json:"sampled_at,omitempty"`
-	ResetAt           string   `json:"reset_at,omitempty"`
-	LastErrorCategory string   `json:"last_error_category,omitempty"`
-}
-
 type quotaSample struct {
-	AuthIndex         string
-	Name              string
-	Identity          string
-	HasSample         bool
-	WeeklyPercentUsed float64
-	SampledAt         time.Time
+	AuthIndex string
+	Name      string
+	Email     string
+	Identity  string
+	HasSample bool
+	FiveHour  windowReading
+	Weekly    windowReading
+	// PolledAt is the last successful usage-endpoint read; HeaderAt the last
+	// rate-limit headers seen on a proxied response for this account.
+	PolledAt          time.Time
+	HeaderAt          time.Time
+	RefusedAt         time.Time
 	LastAttemptAt     time.Time
-	ResetAt           time.Time
 	LastErrorCategory string
 }
 
-func (s quotaSample) known(now time.Time) bool {
-	return s.HasSample && (s.ResetAt.IsZero() || now.Before(s.ResetAt))
+// used returns a window's percent used, reading 0 once the window has reset:
+// a rolled-over window starts empty.
+func (w windowReading) used(now time.Time) float64 {
+	if !w.ResetAt.IsZero() && !now.Before(w.ResetAt) {
+		return 0
+	}
+	return w.Used
 }
 
-// Owner policy: a pre-reset EXHAUSTED sample becomes reset-pending at the
-// reset, not eligible. Only a successful fresh read below the cutoff clears it.
-// A fresh exhausted read stays blocked even if the host reports a past reset.
-func (s quotaSample) resetPending(now time.Time, cutoff float64) bool {
-	return s.HasSample && s.WeeklyPercentUsed >= cutoff && !s.ResetAt.IsZero() &&
-		!now.Before(s.ResetAt) && s.SampledAt.Before(s.ResetAt)
+func (s quotaSample) seenAt() time.Time {
+	if s.HeaderAt.After(s.PolledAt) {
+		return s.HeaderAt
+	}
+	return s.PolledAt
 }
 
-func (s quotaSample) blocked(_ time.Time, cutoff float64) bool {
-	return s.HasSample && s.WeeklyPercentUsed >= cutoff
+func (s quotaSample) fresh(now time.Time, maxStaleness time.Duration) bool {
+	return s.HasSample && now.Sub(s.seenAt()) <= maxStaleness
+}
+
+// refused reports an upstream rate-limit refusal not yet cleared by a later read.
+func (s quotaSample) refused() bool {
+	return !s.RefusedAt.IsZero() && !s.seenAt().After(s.RefusedAt)
 }
 
 type quotaCache struct {
@@ -59,15 +53,10 @@ type quotaCache struct {
 	samples map[string]quotaSample
 }
 
-func (c *quotaCache) empty() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.samples) == 0
-}
-
 func (c *quotaCache) reconcile(auths []physicalClaudeAuth) {
 	keep := make(map[string]struct{}, len(auths))
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, auth := range auths {
 		if strings.TrimSpace(auth.ID) == "" {
 			continue
@@ -78,7 +67,8 @@ func (c *quotaCache) reconcile(auths []physicalClaudeAuth) {
 			sample = quotaSample{}
 		}
 		sample.AuthIndex = auth.AuthIndex
-		sample.Name = strings.TrimSpace(auth.Name)
+		sample.Name = auth.Name
+		sample.Email = auth.Email
 		sample.Identity = auth.Identity
 		c.samples[auth.ID] = sample
 	}
@@ -87,121 +77,83 @@ func (c *quotaCache) reconcile(auths []physicalClaudeAuth) {
 			delete(c.samples, authID)
 		}
 	}
-	c.mu.Unlock()
 }
 
-func (c *quotaCache) claimRefresh(authID string, now time.Time, cutoff float64, minimumAge, blockedRefreshInterval time.Duration) bool {
-	if strings.TrimSpace(authID) == "" {
-		return false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	sample := c.samples[authID]
-	lastCheck := sample.SampledAt
-	if sample.LastAttemptAt.After(lastCheck) {
-		lastCheck = sample.LastAttemptAt
-	}
-	if sample.resetPending(now, cutoff) {
-		// First use at reset bypasses pre-reset timing. Failed post-reset
-		// attempts still use the normal retry age, avoiding a request storm.
-		if lastCheck.Before(sample.ResetAt) {
-			lastCheck = time.Time{}
-		}
-	} else if sample.blocked(now, cutoff) {
-		if blockedRefreshInterval <= 0 {
-			return false
-		}
-		minimumAge = blockedRefreshInterval
-	} else if sample.HasSample && !sample.ResetAt.IsZero() && !now.Before(sample.ResetAt) && lastCheck.Before(sample.ResetAt) {
-		lastCheck = time.Time{}
-	}
-	if !lastCheck.IsZero() && now.Before(lastCheck.Add(minimumAge)) {
-		return false
-	}
-	sample.LastAttemptAt = now
-	sample.LastErrorCategory = ""
-	c.samples[authID] = sample
-	return true
-}
-
-func (c *quotaCache) recordAttempt(authID string, attemptedAt time.Time) {
+func (c *quotaCache) update(authID string, apply func(*quotaSample)) {
 	if strings.TrimSpace(authID) == "" {
 		return
 	}
 	c.mu.Lock()
 	sample := c.samples[authID]
-	sample.LastAttemptAt = attemptedAt
-	sample.LastErrorCategory = ""
+	apply(&sample)
 	c.samples[authID] = sample
 	c.mu.Unlock()
 }
 
-func (c *quotaCache) recordSuccess(authID string, percentUsed float64, resetAt, sampledAt time.Time) {
-	if strings.TrimSpace(authID) == "" {
+func (c *quotaCache) recordAttempt(authID string, at time.Time) {
+	c.update(authID, func(s *quotaSample) {
+		s.LastAttemptAt = at
+		s.LastErrorCategory = ""
+	})
+}
+
+func (c *quotaCache) recordPoll(authID string, result usageResult, at time.Time) {
+	c.update(authID, func(s *quotaSample) {
+		s.HasSample = true
+		s.FiveHour, s.Weekly = result.FiveHour, result.Weekly
+		s.PolledAt = at
+		s.LastErrorCategory = ""
+	})
+}
+
+// recordHeaders applies the windows a proxied response reported. A sample
+// with no poll yet becomes known only once both windows have been seen.
+func (c *quotaCache) recordHeaders(authID string, fiveHour, weekly *windowReading, at time.Time) {
+	if fiveHour == nil && weekly == nil {
 		return
 	}
-	c.mu.Lock()
-	sample := c.samples[authID]
-	sample.HasSample = true
-	sample.WeeklyPercentUsed = percentUsed
-	sample.SampledAt = sampledAt
-	sample.LastAttemptAt = sampledAt
-	sample.ResetAt = resetAt
-	sample.LastErrorCategory = ""
-	c.samples[authID] = sample
-	c.mu.Unlock()
+	c.update(authID, func(s *quotaSample) {
+		if !s.HasSample && (fiveHour == nil || weekly == nil) {
+			return
+		}
+		merge := func(into *windowReading, from *windowReading) {
+			if from == nil {
+				return
+			}
+			resetAt := from.ResetAt
+			if resetAt.IsZero() {
+				resetAt = into.ResetAt
+			}
+			*into = windowReading{Used: from.Used, ResetAt: resetAt}
+		}
+		merge(&s.FiveHour, fiveHour)
+		merge(&s.Weekly, weekly)
+		s.HasSample = true
+		s.HeaderAt = at
+	})
+}
+
+func (c *quotaCache) recordRefusal(authID string, at time.Time) {
+	c.update(authID, func(s *quotaSample) { s.RefusedAt = at })
 }
 
 func (c *quotaCache) recordFailure(authID, category string) {
-	if strings.TrimSpace(authID) == "" {
-		return
-	}
-	c.mu.Lock()
-	sample := c.samples[authID]
-	sample.LastErrorCategory = category
-	c.samples[authID] = sample
-	c.mu.Unlock()
+	c.update(authID, func(s *quotaSample) { s.LastErrorCategory = category })
 }
 
-func (c *quotaCache) isBlocked(authID string, now time.Time, cutoff float64) bool {
-	c.mu.Lock()
-	sample := c.samples[authID]
-	c.mu.Unlock()
-	return sample.blocked(now, cutoff)
-}
-
-func (c *quotaCache) snapshot(authID string) quotaSample {
-	c.mu.Lock()
-	sample := c.samples[authID]
-	c.mu.Unlock()
-	return sample
-}
-
-func (c *quotaCache) statuses(now time.Time, cutoff float64) []cutoffAccountStatus {
+func (c *quotaCache) snapshot(authID string) (quotaSample, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	sample, ok := c.samples[authID]
+	return sample, ok
+}
 
-	accounts := make([]cutoffAccountStatus, 0, len(c.samples))
-	for authID, sample := range c.samples {
-		known := sample.known(now)
-		account := cutoffAccountStatus{
-			ID:                authID,
-			AuthIndex:         sample.AuthIndex,
-			Name:              sample.Name,
-			Known:             known,
-			Blocked:           sample.blocked(now, cutoff),
-			LastErrorCategory: sample.LastErrorCategory,
-		}
-		if known {
-			percentUsed := sample.WeeklyPercentUsed
-			account.WeeklyPercentUsed = &percentUsed
-			if !sample.SampledAt.IsZero() {
-				account.SampledAt = sample.SampledAt.UTC().Format(time.RFC3339Nano)
-			}
-			account.ResetAt = sample.ResetAt.UTC().Format(time.RFC3339Nano)
-		}
-		accounts = append(accounts, account)
+func (c *quotaCache) all() map[string]quotaSample {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]quotaSample, len(c.samples))
+	for id, sample := range c.samples {
+		out[id] = sample
 	}
-	sort.Slice(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
-	return accounts
+	return out
 }

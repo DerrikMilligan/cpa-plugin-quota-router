@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -14,6 +16,7 @@ type physicalClaudeAuth struct {
 	ID        string
 	AuthIndex string
 	Name      string
+	Email     string
 	Identity  string
 }
 
@@ -35,6 +38,7 @@ func physicalClaudeAuths(entries []pluginapi.HostAuthFileEntry) []physicalClaude
 			ID:        entry.ID,
 			AuthIndex: entry.AuthIndex,
 			Name:      strings.TrimSpace(entry.Name),
+			Email:     strings.ToLower(strings.TrimSpace(entry.Email)),
 			Identity:  physicalAuthIdentity(entry),
 		})
 	}
@@ -42,121 +46,182 @@ func physicalClaudeAuths(entries []pluginapi.HostAuthFileEntry) []physicalClaude
 	return auths
 }
 
+// physicalAuthIdentity changes only when a different account takes the slot.
+// The host rewrites auth files on refreshes and status changes, so size and
+// modification time must not count, or every write would discard the reading.
 func physicalAuthIdentity(entry pluginapi.HostAuthFileEntry) string {
-	return fmt.Sprintf("index:%q|path:%q|account:%q|email:%q|file:%d:%d",
+	return fmt.Sprintf("index:%q|path:%q|account:%q|email:%q",
 		entry.AuthIndex,
 		entry.Path,
 		strings.TrimSpace(entry.Account),
 		strings.ToLower(strings.TrimSpace(entry.Email)),
-		entry.Size,
-		entry.ModTime.UnixNano(),
 	)
+}
+
+// accountView is one account's routing state at a moment.
+type accountView struct {
+	ID       string   `json:"id"`
+	Email    string   `json:"email,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	Ceilings ceilings `json:"ceilings"`
+	Known    bool     `json:"known"`
+	Fresh    bool     `json:"fresh"`
+	Refused  bool     `json:"refused,omitempty"`
+	FiveHour float64  `json:"five_hour_used"`
+	Weekly   float64  `json:"weekly_used"`
+	// Headroom is the smaller of the two windows' points left under the ceiling.
+	Headroom        float64 `json:"headroom"`
+	Eligible        bool    `json:"eligible"`
+	Reason          string  `json:"reason,omitempty"`
+	LiveSessions    int     `json:"live_sessions"`
+	FiveHourResetAt string  `json:"five_hour_reset_at,omitempty"`
+	WeeklyResetAt   string  `json:"weekly_reset_at,omitempty"`
+	SeenAt          string  `json:"seen_at,omitempty"`
+	LastError       string  `json:"last_error,omitempty"`
+}
+
+func evaluate(authID string, sample quotaSample, cfg pluginConfig, now time.Time) accountView {
+	view := accountView{
+		ID:        authID,
+		Email:     sample.Email,
+		Name:      sample.Name,
+		Ceilings:  cfg.ceilingsFor(sample.Email, authID, sample.Name),
+		Known:     sample.HasSample,
+		Fresh:     sample.fresh(now, cfg.MaxStaleness),
+		Refused:   sample.refused(),
+		LastError: sample.LastErrorCategory,
+	}
+	if !sample.HasSample {
+		view.Reason = "no usage reading yet"
+		return view
+	}
+	view.FiveHour = sample.FiveHour.used(now)
+	view.Weekly = sample.Weekly.used(now)
+	view.Headroom = math.Min(view.Ceilings.FiveHour-view.FiveHour, view.Ceilings.Weekly-view.Weekly)
+	view.FiveHourResetAt = formatTime(sample.FiveHour.ResetAt)
+	view.WeeklyResetAt = formatTime(sample.Weekly.ResetAt)
+	view.SeenAt = formatTime(sample.seenAt())
+	switch {
+	case !view.Fresh:
+		view.Reason = "usage reading is stale"
+	case view.Refused:
+		view.Reason = "refused upstream; waiting for a fresh reading"
+	case view.FiveHour >= view.Ceilings.FiveHour:
+		view.Reason = fmt.Sprintf("5h at %.0f%% (ceiling %.0f%%)", view.FiveHour, view.Ceilings.FiveHour)
+	case view.Weekly >= view.Ceilings.Weekly:
+		view.Reason = fmt.Sprintf("weekly at %.0f%% (ceiling %.0f%%)", view.Weekly, view.Ceilings.Weekly)
+	default:
+		view.Eligible = true
+	}
+	return view
+}
+
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, *envelopeError) {
 	cfg := r.loadedConfig()
-	if !cfg.Enabled || !isClaudeRequest(req) || !isProtectedModel(req.Model, cfg.ProtectedModels) {
+	if !cfg.Enabled || !isClaudeRequest(req) || !cfg.routesModel(req.Model) {
 		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
-	now := r.now()
-	var selected *pluginapi.SchedulerAuthCandidate
-	var resetPending []*pluginapi.SchedulerAuthCandidate
-	claudeCandidates := 0
-	for i := range req.Candidates {
-		candidate := &req.Candidates[i]
-		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
-		if provider != "" && provider != "claude" {
-			continue
-		}
-		if candidate.ID == "" || strings.TrimSpace(candidate.ID) != candidate.ID {
-			continue
-		}
-		claudeCandidates++
-		sample := r.cache.snapshot(candidate.ID)
-		if sample.resetPending(now, cfg.CutoffPercentUsed) {
-			resetPending = append(resetPending, candidate)
-			continue
-		}
-		if sample.blocked(now, cfg.CutoffPercentUsed) {
-			r.queueCandidateRefresh(candidate.ID, cfg, now)
-			continue
-		}
-		selected = preferredCandidate(selected, candidate)
-	}
-	if selected != nil {
-		// A verified/otherwise normally eligible seat wins over reset-pending
-		// seats regardless of priority; their retries remain asynchronous.
-		for _, candidate := range resetPending {
-			r.queueCandidateRefresh(candidate.ID, cfg, now)
-		}
-		r.queueCandidateRefresh(selected.ID, cfg, now)
-		return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
-	}
-	if len(resetPending) > 0 {
-		ids := make([]string, 0, len(resetPending))
-		for _, candidate := range resetPending {
-			ids = append(ids, candidate.ID)
-		}
-		r.waitResetPending(ids, cfg, now)
-		now = r.now()
-		for _, candidate := range resetPending {
-			sample := r.cache.snapshot(candidate.ID)
-			if sample.HasSample && sample.WeeklyPercentUsed < cfg.CutoffPercentUsed {
-				selected = preferredCandidate(selected, candidate)
-			}
-		}
-		if selected != nil {
-			return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
-		}
 
-		// Fail closed: all seats being reset-pending while the quota host is
-		// down is a narrow window because accounts reset at different times.
-		// An unverified post-reset seat must never be used, even in an outage.
-		// Reuse the existing typed no-seat path; successful exhausted reads
-		// retain the normal exhausted error below, never becoming eligible.
-		if len(resetPending) == claudeCandidates {
-			failures := make(map[string]string, len(ids))
-			categories := make(map[string]struct{})
-			for _, candidate := range resetPending {
-				category := r.resetPendingFailure(candidate.ID, now, cfg.CutoffPercentUsed)
-				if category == "" {
-					break
-				}
-				failures[candidate.ID] = category
-				categories[category] = struct{}{}
-			}
-			if len(failures) == len(ids) {
-				safeCategories := make([]string, 0, len(categories))
-				for category := range categories {
-					safeCategories = append(safeCategories, category)
-				}
-				sort.Strings(safeCategories)
-				decisionError := &envelopeError{
-					Code: exhaustedErrorCode,
-					Message: "no verified seat: all candidate seats await a post-reset quota read; quota host error: " +
-						strings.Join(safeCategories, ", "),
-				}
-				sort.Strings(ids)
-				r.log("warn", decisionError.Message, map[string]any{
-					"seats": ids,
-					"error": failures,
-				})
-				return pluginapi.SchedulerPickResponse{}, decisionError
+	r.pickMu.Lock()
+	defer r.pickMu.Unlock()
+	now := r.now()
+	live := r.sessions.live(now, cfg.AffinityTTL)
+
+	var views []accountView
+	byID := make(map[string]accountView)
+	unknown := false
+	for _, candidate := range req.Candidates {
+		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
+		if (provider != "" && provider != "claude") || candidate.ID == "" {
+			continue
+		}
+		sample, ok := r.cache.snapshot(candidate.ID)
+		if !ok {
+			unknown = true
+		}
+		view := evaluate(candidate.ID, sample, cfg, now)
+		view.LiveSessions = live[candidate.ID]
+		views = append(views, view)
+		byID[view.ID] = view
+	}
+	if unknown {
+		r.requestRefresh()
+	}
+	if len(views) == 0 {
+		return pluginapi.SchedulerPickResponse{Handled: false}, nil
+	}
+
+	best := -math.MaxFloat64
+	for _, view := range views {
+		if view.Eligible && view.Headroom > best {
+			best = view.Headroom
+		}
+	}
+	if best == -math.MaxFloat64 {
+		return pluginapi.SchedulerPickResponse{}, exhaustedError(views)
+	}
+
+	key := sessionKey(req.Options.Headers, req.Model)
+	if key != "" {
+		if boundID, ok := r.sessions.get(key, now, cfg.AffinityTTL); ok {
+			if bound, present := byID[boundID]; present && bound.Eligible && bound.Headroom+cfg.RebalanceMargin >= best {
+				r.sessions.bind(key, boundID, now)
+				return pluginapi.SchedulerPickResponse{AuthID: boundID, Handled: true}, nil
 			}
 		}
 	}
-	if claudeCandidates > 0 {
-		return pluginapi.SchedulerPickResponse{}, &envelopeError{Code: exhaustedErrorCode, Message: exhaustedErrorCode}
+
+	// Accounts within the spread band of the best headroom count as equal; the
+	// one carrying the fewest live conversations, then the one picked longest
+	// ago, takes the new conversation.
+	var band []accountView
+	for _, view := range views {
+		if view.Eligible && view.Headroom >= best-cfg.SpreadBand {
+			band = append(band, view)
+		}
 	}
-	return pluginapi.SchedulerPickResponse{Handled: false}, nil
+	sort.Slice(band, func(i, j int) bool {
+		a, b := band[i], band[j]
+		if a.LiveSessions != b.LiveSessions {
+			return a.LiveSessions < b.LiveSessions
+		}
+		if lastA, lastB := r.lastPicked[a.ID], r.lastPicked[b.ID]; !lastA.Equal(lastB) {
+			return lastA.Before(lastB)
+		}
+		if a.Headroom != b.Headroom {
+			return a.Headroom > b.Headroom
+		}
+		return a.ID < b.ID
+	})
+	chosen := band[0].ID
+	r.lastPicked[chosen] = now
+	if key != "" {
+		r.sessions.bind(key, chosen, now)
+	}
+	return pluginapi.SchedulerPickResponse{AuthID: chosen, Handled: true}, nil
 }
 
-func preferredCandidate(selected, candidate *pluginapi.SchedulerAuthCandidate) *pluginapi.SchedulerAuthCandidate {
-	if selected == nil || candidate.Priority > selected.Priority ||
-		(candidate.Priority == selected.Priority && candidate.ID < selected.ID) {
-		return candidate
+func exhaustedError(views []accountView) *envelopeError {
+	reasons := make([]string, 0, len(views))
+	for _, view := range views {
+		label := view.Email
+		if label == "" {
+			label = view.ID
+		}
+		reasons = append(reasons, label+": "+view.Reason)
 	}
-	return selected
+	sort.Strings(reasons)
+	return &envelopeError{
+		Code:    exhaustedErrorCode,
+		Message: "no Claude account is under its usage ceiling: " + strings.Join(reasons, "; "),
+	}
 }
 
 func isClaudeRequest(req pluginapi.SchedulerPickRequest) bool {
@@ -169,38 +234,52 @@ func isClaudeRequest(req pluginapi.SchedulerPickRequest) bool {
 	return strings.EqualFold(strings.TrimSpace(req.Providers[0]), "claude")
 }
 
-func isProtectedModel(model string, protectedModels []string) bool {
-	model = strings.TrimSpace(model)
-	if model == "" {
-		return false
+type statusResponse struct {
+	Enabled         bool                `json:"enabled"`
+	Models          []string            `json:"models"`
+	Default         ceilings            `json:"default_ceilings"`
+	Overrides       map[string]ceilings `json:"account_ceilings,omitempty"`
+	SpreadBand      float64             `json:"spread_band"`
+	RebalanceMargin float64             `json:"rebalance_margin"`
+	PollInterval    string              `json:"poll_interval"`
+	MaxStaleness    string              `json:"max_staleness"`
+	Accounts        []accountView       `json:"accounts"`
+}
+
+func (r *pluginRuntime) status() statusResponse {
+	cfg := r.loadedConfig()
+	now := r.now()
+	live := r.sessions.live(now, cfg.AffinityTTL)
+	accounts := make([]accountView, 0)
+	for id, sample := range r.cache.all() {
+		view := evaluate(id, sample, cfg, now)
+		view.LiveSessions = live[id]
+		accounts = append(accounts, view)
 	}
-	for _, protectedModel := range protectedModels {
-		if strings.EqualFold(model, protectedModel) {
-			return true
-		}
+	sort.Slice(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
+	models := cfg.Models
+	if len(models) == 0 {
+		models = []string{"*"}
 	}
-	return false
+	return statusResponse{
+		Enabled:         cfg.Enabled,
+		Models:          models,
+		Default:         cfg.Default,
+		Overrides:       cfg.Accounts,
+		SpreadBand:      cfg.SpreadBand,
+		RebalanceMargin: cfg.RebalanceMargin,
+		PollInterval:    cfg.PollInterval.String(),
+		MaxStaleness:    cfg.MaxStaleness.String(),
+		Accounts:        accounts,
+	}
 }
 
 func (r *pluginRuntime) handleManagement(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	if !strings.EqualFold(strings.TrimSpace(req.Method), http.MethodGet) || strings.TrimRight(strings.TrimSpace(req.Path), "/") != managementStatusFullPath {
+	headers := http.Header{"Content-Type": []string{"application/json; charset=utf-8"}}
+	if !strings.EqualFold(strings.TrimSpace(req.Method), http.MethodGet) || !strings.HasSuffix(strings.TrimRight(strings.TrimSpace(req.Path), "/"), managementStatusRoute) {
 		body, _ := json.Marshal(map[string]string{"error": "not found"})
-		return pluginapi.ManagementResponse{
-			StatusCode: http.StatusNotFound,
-			Headers:    http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
-			Body:       body,
-		}
+		return pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Headers: headers, Body: body}
 	}
-	cfg := r.loadedConfig()
-	body, _ := json.Marshal(cutoffStatusResponse{
-		Enabled:           cfg.Enabled,
-		CutoffPercentUsed: cfg.CutoffPercentUsed,
-		ProtectedModels:   cfg.ProtectedModels,
-		Accounts:          r.cache.statuses(r.now(), cfg.CutoffPercentUsed),
-	})
-	return pluginapi.ManagementResponse{
-		StatusCode: http.StatusOK,
-		Headers:    http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
-		Body:       body,
-	}
+	body, _ := json.Marshal(r.status())
+	return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: headers, Body: body}
 }

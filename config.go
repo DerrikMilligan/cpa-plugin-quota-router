@@ -18,53 +18,90 @@ type lifecycleRequest struct {
 	ConfigYAML []byte `json:"config_yaml"`
 }
 
+type rawCeilings struct {
+	FiveHour *float64 `yaml:"five-hour-ceiling"`
+	Weekly   *float64 `yaml:"weekly-ceiling"`
+}
+
 type rawPluginConfig struct {
-	Enabled                *bool     `yaml:"enabled"`
-	ProtectedModels        *[]string `yaml:"protected-models"`
-	CutoffPercentUsed      *float64  `yaml:"cutoff-percent-used"`
-	PollInterval           string    `yaml:"poll-interval"`
-	BlockedRefreshInterval string    `yaml:"blocked-refresh-interval"`
-	RequestTimeout         string    `yaml:"request-timeout"`
+	Enabled         *bool                  `yaml:"enabled"`
+	Models          *[]string              `yaml:"models"`
+	FiveHour        *float64               `yaml:"five-hour-ceiling"`
+	Weekly          *float64               `yaml:"weekly-ceiling"`
+	Accounts        map[string]rawCeilings `yaml:"accounts"`
+	SpreadBand      *float64               `yaml:"spread-band"`
+	RebalanceMargin *float64               `yaml:"rebalance-margin"`
+	AffinityTTL     string                 `yaml:"affinity-ttl"`
+	PollInterval    string                 `yaml:"poll-interval"`
+	MaxStaleness    string                 `yaml:"max-staleness"`
+	RequestTimeout  string                 `yaml:"request-timeout"`
+}
+
+// ceilings are percent-used limits; an account at or above either one takes
+// no request until a reading shows it back under.
+type ceilings struct {
+	FiveHour float64 `json:"five_hour"`
+	Weekly   float64 `json:"weekly"`
 }
 
 type pluginConfig struct {
-	Enabled                bool
-	ProtectedModels        []string
-	CutoffPercentUsed      float64
-	PollInterval           time.Duration
-	BlockedRefreshInterval time.Duration
-	RequestTimeout         time.Duration
-}
-
-type registration struct {
-	SchemaVersion uint32                   `json:"schema_version"`
-	Metadata      pluginapi.Metadata       `json:"metadata"`
-	Capabilities  registrationCapabilities `json:"capabilities"`
-}
-
-type registrationCapabilities struct {
-	Scheduler     bool `json:"scheduler"`
-	ManagementAPI bool `json:"management_api"`
-}
-
-type managementRegistrationResponse struct {
-	Routes []managementRoute `json:"routes"`
-}
-
-type managementRoute struct {
-	Method string `json:"method"`
-	Path   string `json:"path"`
+	Enabled bool
+	// Models is the lowercased set of model IDs routed; empty routes every Claude model.
+	Models   []string
+	Default  ceilings
+	Accounts map[string]ceilings
+	// SpreadBand treats accounts within this many headroom points of the best
+	// as equal and spreads new conversations across them by live load.
+	SpreadBand float64
+	// RebalanceMargin moves a bound conversation once another account has this
+	// many more headroom points than its own.
+	RebalanceMargin float64
+	AffinityTTL     time.Duration
+	PollInterval    time.Duration
+	MaxStaleness    time.Duration
+	RequestTimeout  time.Duration
 }
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		Enabled:                true,
-		ProtectedModels:        []string{defaultProtectedModel},
-		CutoffPercentUsed:      defaultCutoffPercentUsed,
-		PollInterval:           defaultPollInterval,
-		BlockedRefreshInterval: defaultBlockedRefreshInterval,
-		RequestTimeout:         defaultRequestTimeout,
+		Enabled:         true,
+		Default:         ceilings{FiveHour: defaultFiveHourCeiling, Weekly: defaultWeeklyCeiling},
+		Accounts:        map[string]ceilings{},
+		SpreadBand:      defaultSpreadBand,
+		RebalanceMargin: defaultRebalanceMargin,
+		AffinityTTL:     defaultAffinityTTL,
+		PollInterval:    defaultPollInterval,
+		MaxStaleness:    defaultMaxStaleness,
+		RequestTimeout:  defaultRequestTimeout,
 	}
+}
+
+// ceilingsFor resolves an account's ceilings: an override keyed by email wins
+// over one keyed by auth ID or file name, and unset fields keep the default.
+func (c pluginConfig) ceilingsFor(email, authID, name string) ceilings {
+	for _, key := range []string{email, authID, name} {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "" {
+			continue
+		}
+		if override, ok := c.Accounts[key]; ok {
+			return override
+		}
+	}
+	return c.Default
+}
+
+func (c pluginConfig) routesModel(model string) bool {
+	if len(c.Models) == 0 {
+		return true
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	for _, routed := range c.Models {
+		if routed == model {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
@@ -85,62 +122,102 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 	if decoded.Enabled != nil {
 		cfg.Enabled = *decoded.Enabled
 	}
-	if decoded.ProtectedModels != nil {
-		protectedModels, err := normalizeProtectedModels(*decoded.ProtectedModels)
-		if err != nil {
+	if decoded.Models != nil {
+		cfg.Models = normalizeModels(*decoded.Models)
+	}
+	if decoded.FiveHour != nil {
+		cfg.Default.FiveHour = *decoded.FiveHour
+	}
+	if decoded.Weekly != nil {
+		cfg.Default.Weekly = *decoded.Weekly
+	}
+	if err := validCeilings("default", cfg.Default); err != nil {
+		return pluginConfig{}, err
+	}
+	for key, raw := range decoded.Accounts {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "" {
+			return pluginConfig{}, fmt.Errorf("accounts must not contain an empty key")
+		}
+		account := cfg.Default
+		if raw.FiveHour != nil {
+			account.FiveHour = *raw.FiveHour
+		}
+		if raw.Weekly != nil {
+			account.Weekly = *raw.Weekly
+		}
+		if err := validCeilings(key, account); err != nil {
 			return pluginConfig{}, err
 		}
-		cfg.ProtectedModels = protectedModels
+		cfg.Accounts[key] = account
 	}
-	if decoded.CutoffPercentUsed != nil {
-		cfg.CutoffPercentUsed = *decoded.CutoffPercentUsed
+	if decoded.SpreadBand != nil {
+		cfg.SpreadBand = *decoded.SpreadBand
 	}
-	if value := strings.TrimSpace(decoded.PollInterval); value != "" {
-		interval, err := time.ParseDuration(value)
-		if err != nil {
-			return pluginConfig{}, fmt.Errorf("poll-interval must be a Go duration")
+	if decoded.RebalanceMargin != nil {
+		cfg.RebalanceMargin = *decoded.RebalanceMargin
+	}
+	if !finite(cfg.SpreadBand) || cfg.SpreadBand < 0 || cfg.SpreadBand > 100 {
+		return pluginConfig{}, fmt.Errorf("spread-band must be between 0 and 100")
+	}
+	if !finite(cfg.RebalanceMargin) || cfg.RebalanceMargin < 0 || cfg.RebalanceMargin > 100 {
+		return pluginConfig{}, fmt.Errorf("rebalance-margin must be between 0 and 100")
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+		into  *time.Duration
+	}{
+		{"affinity-ttl", decoded.AffinityTTL, &cfg.AffinityTTL},
+		{"poll-interval", decoded.PollInterval, &cfg.PollInterval},
+		{"max-staleness", decoded.MaxStaleness, &cfg.MaxStaleness},
+		{"request-timeout", decoded.RequestTimeout, &cfg.RequestTimeout},
+	} {
+		value := strings.TrimSpace(field.value)
+		if value == "" {
+			continue
 		}
-		cfg.PollInterval = interval
-	}
-	if value := strings.TrimSpace(decoded.BlockedRefreshInterval); value != "" {
-		interval, err := time.ParseDuration(value)
-		if err != nil {
-			return pluginConfig{}, fmt.Errorf("blocked-refresh-interval must be a Go duration")
+		parsed, err := time.ParseDuration(value)
+		if err != nil || parsed <= 0 {
+			return pluginConfig{}, fmt.Errorf("%s must be a positive Go duration", field.name)
 		}
-		cfg.BlockedRefreshInterval = interval
+		*field.into = parsed
 	}
-	if value := strings.TrimSpace(decoded.RequestTimeout); value != "" {
-		timeout, err := time.ParseDuration(value)
-		if err != nil {
-			return pluginConfig{}, fmt.Errorf("request-timeout must be a Go duration")
-		}
-		cfg.RequestTimeout = timeout
+	if cfg.PollInterval < minimumPollInterval && e2eShortIntervals != "true" {
+		cfg.PollInterval = minimumPollInterval
 	}
-	if math.IsNaN(cfg.CutoffPercentUsed) || math.IsInf(cfg.CutoffPercentUsed, 0) || cfg.CutoffPercentUsed < 0 || cfg.CutoffPercentUsed > 100 {
-		return pluginConfig{}, fmt.Errorf("cutoff-percent-used must be between 0 and 100")
-	}
-	if cfg.PollInterval <= 0 {
-		return pluginConfig{}, fmt.Errorf("poll-interval must be greater than zero")
-	}
-	if cfg.BlockedRefreshInterval < 0 {
-		return pluginConfig{}, fmt.Errorf("blocked-refresh-interval must not be negative")
-	}
-	if cfg.RequestTimeout <= 0 {
-		return pluginConfig{}, fmt.Errorf("request-timeout must be greater than zero")
+	if cfg.MaxStaleness < 2*cfg.PollInterval {
+		cfg.MaxStaleness = 2 * cfg.PollInterval
 	}
 	return cfg, nil
 }
 
-func normalizeProtectedModels(models []string) ([]string, error) {
-	if len(models) == 0 {
-		return nil, fmt.Errorf("protected-models must contain at least one model")
+// e2eShortIntervals, set to "true" by the process test's -ldflags, lets it poll
+// faster than the production floor.
+var e2eShortIntervals = ""
+
+func finite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func validCeilings(name string, c ceilings) error {
+	if !finite(c.FiveHour) || c.FiveHour <= 0 || c.FiveHour > 100 {
+		return fmt.Errorf("%s five-hour-ceiling must be above 0 and at most 100", name)
 	}
+	if !finite(c.Weekly) || c.Weekly <= 0 || c.Weekly > 100 {
+		return fmt.Errorf("%s weekly-ceiling must be above 0 and at most 100", name)
+	}
+	return nil
+}
+
+func normalizeModels(models []string) []string {
 	normalized := make([]string, 0, len(models))
 	seen := make(map[string]struct{}, len(models))
 	for _, model := range models {
 		model = strings.ToLower(strings.TrimSpace(model))
-		if model == "" {
-			return nil, fmt.Errorf("protected-models must not contain empty model names")
+		if model == "" || model == "*" {
+			// "*" or an empty entry means every Claude model.
+			return nil
 		}
 		if _, exists := seen[model]; exists {
 			continue
@@ -149,7 +226,28 @@ func normalizeProtectedModels(models []string) ([]string, error) {
 		normalized = append(normalized, model)
 	}
 	sort.Strings(normalized)
-	return normalized, nil
+	return normalized
+}
+
+type registration struct {
+	SchemaVersion uint32                   `json:"schema_version"`
+	Metadata      pluginapi.Metadata       `json:"metadata"`
+	Capabilities  registrationCapabilities `json:"capabilities"`
+}
+
+type registrationCapabilities struct {
+	Scheduler     bool `json:"scheduler"`
+	UsagePlugin   bool `json:"usage_plugin"`
+	ManagementAPI bool `json:"management_api"`
+}
+
+type managementRegistrationResponse struct {
+	Routes []managementRoute `json:"routes"`
+}
+
+type managementRoute struct {
+	Method string `json:"method"`
+	Path   string `json:"path"`
 }
 
 func managementRegistration() managementRegistrationResponse {
@@ -165,36 +263,21 @@ func pluginRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             pluginName,
 			Version:          pluginVersion,
-			Author:           "Smarty Pants Inc",
+			Author:           "Derrik Milligan (fork of Smarty Pants Inc quota-router)",
 			GitHubRepository: "https://github.com/Smarty-Pants-Inc/cpa-plugin-quota-router",
 			ConfigFields: []pluginapi.ConfigField{
-				{
-					Name:        "protected-models",
-					Type:        pluginapi.ConfigFieldTypeArray,
-					Description: "Exact Claude model IDs whose routing is paused at the weekly cutoff. Default: [claude-fable-5].",
-				},
-				{
-					Name:        "cutoff-percent-used",
-					Type:        pluginapi.ConfigFieldTypeNumber,
-					Description: "Blocks a Claude auth when seven_day utilization reaches this percent used. Default: 50.",
-				},
-				{
-					Name:        "poll-interval",
-					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Minimum cached-usage age before a protected-model request queues another refresh. Default: 5m.",
-				},
-				{
-					Name:        "blocked-refresh-interval",
-					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Minimum age since the latest sample or attempt before a protected-model request queues a blocked auth refresh, as a Go duration. Default: 6h; 0 disables.",
-				},
-				{
-					Name:        "request-timeout",
-					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Anthropic usage request timeout as a Go duration. Default: 10s.",
-				},
+				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Claude model IDs routed by headroom. Empty or [\"*\"] routes every Claude model. Default: all."},
+				{Name: "five-hour-ceiling", Type: pluginapi.ConfigFieldTypeNumber, Description: "Percent of the 5-hour window an account may reach before it takes no requests. Default: 90."},
+				{Name: "weekly-ceiling", Type: pluginapi.ConfigFieldTypeNumber, Description: "Percent of the weekly window an account may reach before it takes no requests. Default: 90."},
+				{Name: "accounts", Type: pluginapi.ConfigFieldTypeObject, Description: "Per-account ceilings keyed by email or auth file name, e.g. {\"a@x.com\": {\"five-hour-ceiling\": 70}}."},
+				{Name: "spread-band", Type: pluginapi.ConfigFieldTypeNumber, Description: "Accounts within this many headroom points of the best share new conversations by live load. Default: 10."},
+				{Name: "rebalance-margin", Type: pluginapi.ConfigFieldTypeNumber, Description: "A bound conversation moves once another account has this many more headroom points. Default: 25."},
+				{Name: "affinity-ttl", Type: pluginapi.ConfigFieldTypeString, Description: "Idle time before a conversation's account binding expires. Default: 1h."},
+				{Name: "poll-interval", Type: pluginapi.ConfigFieldTypeString, Description: "Usage endpoint read cadence per account (minimum 30s). Default: 2m."},
+				{Name: "max-staleness", Type: pluginapi.ConfigFieldTypeString, Description: "A reading older than this makes the account ineligible (at least twice poll-interval). Default: 10m."},
+				{Name: "request-timeout", Type: pluginapi.ConfigFieldTypeString, Description: "Usage endpoint request timeout. Default: 10s."},
 			},
 		},
-		Capabilities: registrationCapabilities{Scheduler: true, ManagementAPI: true},
+		Capabilities: registrationCapabilities{Scheduler: true, UsagePlugin: true, ManagementAPI: true},
 	}
 }
