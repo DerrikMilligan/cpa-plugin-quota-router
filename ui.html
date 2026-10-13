@@ -36,6 +36,7 @@
   th { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
   tr:last-child td { border-bottom: 0; }
   .acct { font-weight: 600; }
+  td.status { min-width: 170px; }
   .sub { color: var(--muted); font-size: 12px; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
   .pill.ok { background: var(--pill-ok); color: var(--pill-ok-text); }
@@ -52,7 +53,7 @@
   .edit input { width: 58px; font: inherit; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px;
                 background: var(--bg); color: var(--text); }
   .edit input.dirty { border-color: var(--accent); }
-  .tag { font-size: 11px; color: var(--accent); font-weight: 600; }
+  .tag { font-size: 11px; color: var(--accent); font-weight: 600; margin-left: 6px; }
   #notice { margin: 0 0 12px; padding: 8px 12px; border-radius: 8px; display: none; }
   #notice.show { display: block; }
   #notice.error { background: var(--pill-bad); color: var(--pill-bad-text); }
@@ -227,16 +228,16 @@
     reset.addEventListener("click", () => saveCeilings(account.email || account.id, "", "", reset));
     return el("tr", {},
       el("td", {},
-        el("div", { class: "acct" }, account.email || account.id),
+        el("div", { class: "acct" }, account.email || account.id,
+          account.override ? el("span", { class: "tag", title: "Ceilings set for this account" }, "custom") : null),
         el("div", { class: "sub" }, ago(account.seen_at), account.last_error ? " - " + account.last_error : "")),
-      el("td", {}, status, account.eligible ? null : el("div", { class: "sub" }, account.reason || "")),
+      el("td", { class: "status" }, status, account.eligible ? null : el("div", { class: "sub" }, account.reason || "")),
       el("td", {}, bar(account.five_hour_used, account.ceilings.five_hour, account.five_hour_reset_at, known)),
       el("td", {}, bar(account.weekly_used, account.ceilings.weekly, account.weekly_reset_at, known)),
       el("td", { class: "num headroom" }, known ? Math.max(0, Math.round(account.headroom)) : "-"),
       el("td", { class: "num" }, account.live_sessions),
       el("td", {},
-        el("div", { class: "edit" }, five.wrap, week.wrap, save, reset,
-          account.override ? el("span", { class: "tag" }, "custom") : null)));
+        el("div", { class: "edit" }, five.wrap, week.wrap, save, reset)));
   }
 
   async function load(force) {
