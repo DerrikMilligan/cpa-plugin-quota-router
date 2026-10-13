@@ -40,15 +40,15 @@ const (
 	pollErrorRead              = "read_error"
 )
 
-var pluginVersion = "1.2.0"
+var pluginVersion = "1.2.1"
 
 // Variable only so the C-shared integration test can inject a local fixture.
 var usageEndpoint = defaultUsageEndpoint
 
-var activeRuntime = newPluginRuntime(
-	cgoHostClient{},
-	newHTTPUsageFetcher(usageEndpoint, nil).fetch,
-	time.Now,
-)
+var activeRuntime = func() *pluginRuntime {
+	r := newPluginRuntime(cgoHostClient{}, newHTTPUsageFetcher(usageEndpoint, nil).fetch, time.Now)
+	r.instanceMarker, r.instanceToken = defaultInstanceMarker(), newInstanceToken()
+	return r
+}()
 
 func main() {}

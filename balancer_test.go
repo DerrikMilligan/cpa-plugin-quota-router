@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -601,5 +603,54 @@ func TestRateLimitBackoffHonoursRetryAfterAndCaps(t *testing.T) {
 	}
 	if got := parseRetryAfter("120", testNow); got != 2*time.Minute {
 		t.Fatalf("parseRetryAfter seconds = %v", got)
+	}
+}
+
+func TestASupersededInstanceStopsPolling(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "active")
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{{
+		ID: authIDFor("a@x.com"), AuthIndex: "1", Provider: "claude", Path: "/auth/a", Email: "a@x.com",
+	}}}
+	var oldCalls, newCalls atomic.Int64
+	fetcher := func(n *atomic.Int64) usageFetcher {
+		return func(context.Context, string, time.Duration) (usageResult, string) {
+			n.Add(1)
+			return usageResult{Weekly: windowReading{Used: 10}}, ""
+		}
+	}
+	cfg := defaultPluginConfig()
+	cfg.PollInterval = 20 * time.Millisecond
+
+	old := newPluginRuntime(host, fetcher(&oldCalls), time.Now)
+	old.instanceMarker, old.instanceToken = marker, []byte("old")
+	old.applyConfig(cfg)
+	defer old.shutdown()
+	waitUntil(t, func() bool { return oldCalls.Load() >= 2 })
+
+	// A hot reload loads a new version alongside; the old one is never shut down.
+	newer := newPluginRuntime(host, fetcher(&newCalls), time.Now)
+	newer.instanceMarker, newer.instanceToken = marker, []byte("new")
+	newer.applyConfig(cfg)
+	defer newer.shutdown()
+	waitUntil(t, func() bool { return newCalls.Load() >= 2 })
+
+	stoppedAt := oldCalls.Load()
+	time.Sleep(150 * time.Millisecond)
+	if extra := oldCalls.Load() - stoppedAt; extra > 1 {
+		t.Fatalf("superseded instance kept polling: %d more reads", extra)
+	}
+	if newCalls.Load() < 4 {
+		t.Fatalf("the current instance stopped polling too: %d reads", newCalls.Load())
+	}
+}
+
+func waitUntil(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met in time")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

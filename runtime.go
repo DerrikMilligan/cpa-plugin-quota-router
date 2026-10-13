@@ -1,9 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +46,12 @@ type pluginRuntime struct {
 	wake        chan struct{}
 	cancel      context.CancelFunc
 	done        chan struct{}
+	// instanceMarker names a per-process file the configured instance writes
+	// instanceToken into. The host keeps a hot-reloaded plugin's previous
+	// versions loaded without shutting them down, so each poll loop checks the
+	// marker and stops once a newer instance has claimed it. Empty disables it.
+	instanceMarker string
+	instanceToken  []byte
 	// pollMu guards pollDone, which is closed and replaced after every
 	// refresh pass so picks can wait for fresh readings.
 	pollMu   sync.Mutex
@@ -62,6 +74,37 @@ func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time)
 	cfg := defaultPluginConfig()
 	runtime.config.Store(&cfg)
 	return runtime
+}
+
+func newInstanceToken() []byte {
+	raw := make([]byte, 16)
+	_, _ = rand.Read(raw)
+	return []byte(pluginVersion + ":" + hex.EncodeToString(raw))
+}
+
+func defaultInstanceMarker() string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("cpa-%s-%d.active", pluginName, os.Getpid()))
+}
+
+// claimInstance records this instance as the one that should poll.
+func (r *pluginRuntime) claimInstance() {
+	if r.instanceMarker == "" {
+		return
+	}
+	tmp := r.instanceMarker + ".tmp"
+	if err := os.WriteFile(tmp, r.instanceToken, 0o600); err == nil {
+		_ = os.Rename(tmp, r.instanceMarker)
+	}
+}
+
+// superseded reports a newer instance's claim. A missing or unreadable
+// marker does not stop polling.
+func (r *pluginRuntime) superseded() bool {
+	if r.instanceMarker == "" {
+		return false
+	}
+	current, err := os.ReadFile(r.instanceMarker)
+	return err == nil && len(current) > 0 && !bytes.Equal(current, r.instanceToken)
 }
 
 func (r *pluginRuntime) loadedConfig() pluginConfig {
@@ -91,6 +134,7 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 		r.stopLocked()
 		return
 	}
+	r.claimInstance()
 	if r.cancel != nil {
 		if previous.Enabled && previous.PollInterval == cfg.PollInterval {
 			r.log("info", "quota balancer reconfigured", fields)
@@ -155,15 +199,20 @@ func (r *pluginRuntime) refreshLoop(ctx context.Context, interval time.Duration,
 	defer close(done)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	r.refreshAll(ctx, false)
+	onDemand := false
 	for {
+		if r.superseded() {
+			r.log("info", "quota balancer superseded by a newer plugin instance; polling stopped", nil)
+			return
+		}
+		r.refreshAll(ctx, onDemand)
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.refreshAll(ctx, false)
+			onDemand = false
 		case <-wake:
-			r.refreshAll(ctx, true)
+			onDemand = true
 		}
 	}
 }
