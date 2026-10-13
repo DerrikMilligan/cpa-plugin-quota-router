@@ -777,3 +777,118 @@ func TestUsageReadsAreSpacedOut(t *testing.T) {
 		}
 	}
 }
+
+// probeRuntime has one readable account and one the usage endpoint rejects.
+func probeRuntime(t *testing.T, cfg pluginConfig, unreadableError string) (*pluginRuntime, *clock) {
+	t.Helper()
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{
+		{ID: authIDFor("known@x.com"), AuthIndex: "1", Provider: "claude", Path: "/auth/k", Email: "known@x.com"},
+		{ID: authIDFor("unread@x.com"), AuthIndex: "2", Provider: "claude", Path: "/auth/u", Email: "unread@x.com"},
+	}}
+	c := &clock{now: testNow}
+	fetch := func(_ context.Context, token string, _ time.Duration) (usageResult, string) {
+		if token == "token-2" {
+			return usageResult{}, unreadableError
+		}
+		return usageResult{
+			FiveHour: windowReading{Used: 10, ResetAt: c.Now().Add(3 * time.Hour)},
+			Weekly:   windowReading{Used: 10, ResetAt: c.Now().Add(72 * time.Hour)},
+		}, ""
+	}
+	r := newPluginRuntime(host, fetch, c.Now)
+	r.config.Store(&cfg)
+	r.refreshAll(context.Background())
+	return r, c
+}
+
+func pickWithStatus(t *testing.T, r *pluginRuntime, session string, statuses map[string]string) string {
+	t.Helper()
+	req := pluginapi.SchedulerPickRequest{Provider: "claude", Model: "claude-opus-5-5"}
+	for _, email := range []string{"known@x.com", "unread@x.com"} {
+		req.Candidates = append(req.Candidates, pluginapi.SchedulerAuthCandidate{ID: authIDFor(email), Provider: "claude", Status: statuses[email]})
+	}
+	if session != "" {
+		req.Options.Headers = map[string][]string{"X-Claude-Code-Session-Id": {session}}
+	}
+	resp, errEnv := r.pick(req)
+	if errEnv != nil {
+		t.Fatalf("pick failed: %s", errEnv.Message)
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(resp.AuthID, "claude-"), ".json")
+}
+
+func TestUnreadableAccountGetsOneProbePerInterval(t *testing.T) {
+	r, c := probeRuntime(t, defaultPluginConfig(), pollErrorRateLimited)
+	if got := pickWithStatus(t, r, "conv-1", nil); got != "unread@x.com" {
+		t.Fatalf("first new conversation went to %s, want a probe of unread@x.com", got)
+	}
+	for i := 2; i <= 4; i++ {
+		c.advance(time.Minute)
+		if got := pickWithStatus(t, r, fmt.Sprintf("conv-%d", i), nil); got != "known@x.com" {
+			t.Fatalf("conversation %d probed again within the interval: %s", i, got)
+		}
+	}
+	c.advance(2 * time.Minute) // 5m since the probe
+	if got := pickWithStatus(t, r, "conv-5", nil); got != "unread@x.com" {
+		t.Fatalf("no new probe after the interval: %s", got)
+	}
+}
+
+func TestProbeHeadersMakeTheAccountRoutable(t *testing.T) {
+	r, c := probeRuntime(t, defaultPluginConfig(), pollErrorRateLimited)
+	pickWithStatus(t, r, "conv-1", nil)
+	r.handleUsage(usageRecord{AuthID: authIDFor("unread@x.com"), ResponseHeaders: rateHeaders(0.05, 0.05)})
+	c.advance(time.Second)
+	// Now known and under its ceilings: the probe conversation stays put.
+	if got := pickWithStatus(t, r, "conv-1", nil); got != "unread@x.com" {
+		t.Fatalf("probe conversation left an eligible account: %s", got)
+	}
+	if view := r.status().Accounts[1]; !view.Known || !view.Eligible {
+		t.Fatalf("probed account should now be known and eligible: %#v", view)
+	}
+}
+
+func TestProbeOverTheCeilingMovesTheConversation(t *testing.T) {
+	r, c := probeRuntime(t, defaultPluginConfig(), pollErrorRateLimited)
+	if got := pickWithStatus(t, r, "conv-1", nil); got != "unread@x.com" {
+		t.Fatalf("setup: %s", got)
+	}
+	r.handleUsage(usageRecord{AuthID: authIDFor("unread@x.com"), ResponseHeaders: rateHeaders(0.10, 0.95)})
+	c.advance(time.Second)
+	if got := pickWithStatus(t, r, "conv-1", nil); got != "known@x.com" {
+		t.Fatalf("conversation stayed on a probe that reported 95%% weekly: %s", got)
+	}
+}
+
+func TestProbesSkipUnhealthyAndRejectedAccounts(t *testing.T) {
+	r, _ := probeRuntime(t, defaultPluginConfig(), pollErrorRateLimited)
+	if got := pickWithStatus(t, r, "conv-1", map[string]string{"unread@x.com": "error"}); got != "known@x.com" {
+		t.Fatalf("probed an account the host reports in error: %s", got)
+	}
+	rejected, _ := probeRuntime(t, defaultPluginConfig(), pollErrorUnauthorized)
+	if got := pickWithStatus(t, rejected, "conv-1", nil); got != "known@x.com" {
+		t.Fatalf("probed an account whose credential was rejected: %s", got)
+	}
+}
+
+func TestProbesCanBeTurnedOff(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.ProbeUnread = false
+	r, _ := probeRuntime(t, cfg, pollErrorRateLimited)
+	if got := pickWithStatus(t, r, "conv-1", nil); got != "known@x.com" {
+		t.Fatalf("probe-unread false still probed: %s", got)
+	}
+}
+
+func TestProbeDoesNotStealABoundConversation(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.ProbeUnread = false
+	r, _ := probeRuntime(t, cfg, pollErrorRateLimited)
+	pickWithStatus(t, r, "conv-1", nil) // bound to known@x.com
+	enabled := r.loadedConfig()
+	enabled.ProbeUnread = true
+	r.config.Store(&enabled)
+	if got := pickWithStatus(t, r, "conv-1", nil); got != "known@x.com" {
+		t.Fatalf("a probe pulled an existing conversation off its account: %s", got)
+	}
+}

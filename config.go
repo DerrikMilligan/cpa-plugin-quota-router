@@ -31,6 +31,7 @@ type rawPluginConfig struct {
 	Accounts        map[string]rawCeilings `yaml:"accounts"`
 	SpreadBand      *float64               `yaml:"spread-band"`
 	RebalanceMargin *float64               `yaml:"rebalance-margin"`
+	ProbeUnread     *bool                  `yaml:"probe-unread"`
 	AffinityTTL     string                 `yaml:"affinity-ttl"`
 	PollInterval    string                 `yaml:"poll-interval"`
 	MaxStaleness    string                 `yaml:"max-staleness"`
@@ -56,10 +57,13 @@ type pluginConfig struct {
 	// RebalanceMargin moves a bound conversation once another account has this
 	// many more headroom points than its own.
 	RebalanceMargin float64
-	AffinityTTL     time.Duration
-	PollInterval    time.Duration
-	MaxStaleness    time.Duration
-	RequestTimeout  time.Duration
+	// ProbeUnread lets an account with no usage reading carry one new
+	// conversation per probe interval so its response headers supply one.
+	ProbeUnread    bool
+	AffinityTTL    time.Duration
+	PollInterval   time.Duration
+	MaxStaleness   time.Duration
+	RequestTimeout time.Duration
 }
 
 func defaultPluginConfig() pluginConfig {
@@ -69,6 +73,7 @@ func defaultPluginConfig() pluginConfig {
 		Accounts:        map[string]ceilings{},
 		SpreadBand:      defaultSpreadBand,
 		RebalanceMargin: defaultRebalanceMargin,
+		ProbeUnread:     true,
 		AffinityTTL:     defaultAffinityTTL,
 		PollInterval:    defaultPollInterval,
 		MaxStaleness:    defaultMaxStaleness,
@@ -162,6 +167,9 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 	}
 	if decoded.RebalanceMargin != nil {
 		cfg.RebalanceMargin = *decoded.RebalanceMargin
+	}
+	if decoded.ProbeUnread != nil {
+		cfg.ProbeUnread = *decoded.ProbeUnread
 	}
 	if !finite(cfg.SpreadBand) || cfg.SpreadBand < 0 || cfg.SpreadBand > 100 {
 		return pluginConfig{}, fmt.Errorf("spread-band must be between 0 and 100")
@@ -293,6 +301,7 @@ func pluginRegistration() registration {
 				{Name: "accounts", Type: pluginapi.ConfigFieldTypeObject, Description: "Per-account ceilings that override the two defaults above, as a JSON object keyed by account email or auth file name. Each value can set five-hour-ceiling and weekly-ceiling in percent; a field left out uses the default. The example@example.com entry matches no account: copy it, change the email and set the numbers. Delete an entry to return that account to the defaults. A lower ceiling also means less traffic, since the account has less headroom."},
 				{Name: "spread-band", Type: pluginapi.ConfigFieldTypeNumber, Description: "Accounts within this many headroom points of the best count as tied, and new conversations spread across them by load. Default: 10."},
 				{Name: "rebalance-margin", Type: pluginapi.ConfigFieldTypeNumber, Description: "A running conversation moves to another account once that account has this many more headroom points than its own. Each move costs one cold prompt cache. Default: 25."},
+				{Name: "probe-unread", Type: pluginapi.ConfigFieldTypeBoolean, Description: "When the usage endpoint cannot read an account, let it take one new conversation every 5 minutes so the response headers report its usage. The account may take that one request above its ceiling before it is held. Default: on."},
 				{Name: "affinity-ttl", Type: pluginapi.ConfigFieldTypeString, Description: "How long a conversation can sit idle before its account binding expires, as a duration such as 1h or 30m. Default: 1h."},
 				{Name: "poll-interval", Type: pluginapi.ConfigFieldTypeString, Description: "How often each account usage is read from Anthropic, as a duration (minimum 30s). Default: 2m."},
 				{Name: "max-staleness", Type: pluginapi.ConfigFieldTypeString, Description: "A reading older than this makes the account ineligible; at least twice poll-interval. Default: 10m."},

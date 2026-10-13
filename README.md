@@ -41,6 +41,11 @@ every account toward the same remaining usage.
   A 429 from the usage endpoint backs that account off (Retry-After, else
   doubling from `poll-interval` up to 15m). A `rejected` window status or an
   upstream 429 on a request blocks the account until a fresh read.
+- **Probes** (`probe-unread`, on by default): an account the usage endpoint
+  cannot read (e.g. rate-limited) and that the host reports active gets one
+  new conversation every 5 minutes, so that response's rate-limit headers
+  supply its reading. That one request can land above the ceiling before the
+  account is held; existing conversations never move onto an unread account.
 - **Readings persist** in `~/.cache/cpa-quota-balancer/state.json` (no
   credentials), so a restart or plugin reload starts from cached data and
   reads only what is stale. CLIProxyAPI keeps a reloaded plugin's old versions
@@ -66,6 +71,7 @@ plugins:
           weekly-ceiling: 90
       spread-band: 10            # headroom points treated as a tie
       rebalance-margin: 25       # headroom gap that moves a live conversation
+      probe-unread: true         # unreadable accounts take one conversation per 5m
       affinity-ttl: 1h           # idle time before a conversation binding expires
       poll-interval: 2m          # usage endpoint cadence (minimum 30s)
       max-staleness: 10m         # older readings make an account ineligible (>= 2x poll-interval)

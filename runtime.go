@@ -44,6 +44,7 @@ type pluginRuntime struct {
 	cache       quotaCache
 	sessions    *sessionStore
 	lastPicked  map[string]time.Time
+	lastProbe   map[string]time.Time
 	host        hostClient
 	fetch       usageFetcher
 	now         func() time.Time
@@ -79,6 +80,7 @@ func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time)
 		cache:      quotaCache{samples: make(map[string]quotaSample)},
 		sessions:   newSessionStore(defaultMaxSessions),
 		lastPicked: make(map[string]time.Time),
+		lastProbe:  make(map[string]time.Time),
 		host:       host,
 		fetch:      fetch,
 		now:        now,

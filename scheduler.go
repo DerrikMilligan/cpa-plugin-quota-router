@@ -81,6 +81,7 @@ type accountView struct {
 	SeenAt          string  `json:"seen_at,omitempty"`
 	LastError       string  `json:"last_error,omitempty"`
 	BackoffUntil    string  `json:"backoff_until,omitempty"`
+	HostStatus      string  `json:"host_status,omitempty"`
 }
 
 func evaluate(authID string, sample quotaSample, cfg pluginConfig, now time.Time) accountView {
@@ -152,18 +153,30 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 	defer r.pickMu.Unlock()
 	now := r.now()
 	views, byID, best, _ = r.candidateViews(req, cfg)
-	if best == noHeadroom {
-		return pluginapi.SchedulerPickResponse{}, exhaustedError(views)
-	}
 
 	key := sessionKey(req.Options.Headers, req.Model)
-	if key != "" {
+	if key != "" && best != noHeadroom {
 		if boundID, ok := r.sessions.get(key, now, cfg.AffinityTTL); ok {
 			if bound, present := byID[boundID]; present && bound.Eligible && bound.Headroom+cfg.RebalanceMargin >= best {
 				r.sessions.bind(key, boundID, now)
 				return pluginapi.SchedulerPickResponse{AuthID: boundID, Handled: true}, nil
 			}
 		}
+	}
+
+	// An account the usage endpoint cannot read gets one new conversation per
+	// probeInterval so its usage arrives in that response's rate-limit headers.
+	if probe, ok := r.probeCandidate(views, cfg, now); ok {
+		r.lastProbe[probe.ID] = now
+		r.lastPicked[probe.ID] = now
+		if key != "" {
+			r.sessions.bind(key, probe.ID, now)
+		}
+		r.log("info", "quota balancer probing an account with no usage reading", map[string]any{"auth_id": probe.ID})
+		return pluginapi.SchedulerPickResponse{AuthID: probe.ID, Handled: true}, nil
+	}
+	if best == noHeadroom {
+		return pluginapi.SchedulerPickResponse{}, exhaustedError(views)
 	}
 
 	// Accounts within the spread band of the best headroom count as equal; the
@@ -199,7 +212,44 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 const (
 	noHeadroom       = -math.MaxFloat64
 	maxFirstReadWait = 5 * time.Second
+	probeInterval    = 5 * time.Minute
 )
+
+// probeCandidate picks an account with no reading that may carry a probe: the
+// host reports it active, its credential has not been rejected, and it has
+// not been probed within probeInterval. Least recently probed wins.
+func (r *pluginRuntime) probeCandidate(views []accountView, cfg pluginConfig, now time.Time) (accountView, bool) {
+	if !cfg.ProbeUnread {
+		return accountView{}, false
+	}
+	var chosen accountView
+	found := false
+	for _, view := range views {
+		if view.Known || view.Refused || !hostHealthy(view.HostStatus) {
+			continue
+		}
+		switch view.LastError {
+		case pollErrorUnauthorized, pollErrorForbidden, pollErrorInvalidCredential, pollErrorMissingToken:
+			continue
+		}
+		if now.Sub(r.lastProbe[view.ID]) < probeInterval {
+			continue
+		}
+		if !found || r.lastProbe[view.ID].Before(r.lastProbe[chosen.ID]) ||
+			(r.lastProbe[view.ID].Equal(r.lastProbe[chosen.ID]) && view.ID < chosen.ID) {
+			chosen, found = view, true
+		}
+	}
+	return chosen, found
+}
+
+func hostHealthy(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "", "active", "ok", "ready":
+		return true
+	}
+	return false
+}
 
 // candidateViews evaluates the Claude candidates. best is the highest eligible
 // headroom (noHeadroom when none qualifies); unread reports a candidate with
@@ -221,6 +271,7 @@ func (r *pluginRuntime) candidateViews(req pluginapi.SchedulerPickRequest, cfg p
 		}
 		view := evaluate(candidate.ID, sample, cfg, now)
 		view.LiveSessions = live[candidate.ID]
+		view.HostStatus = candidate.Status
 		views = append(views, view)
 		byID[view.ID] = view
 		if view.Eligible && view.Headroom > best {
