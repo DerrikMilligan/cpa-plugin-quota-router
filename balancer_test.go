@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -86,7 +87,7 @@ func newTestRuntime(t *testing.T, cfg pluginConfig, usage map[string][2]float64)
 	}
 	r := newPluginRuntime(host, fetch, c.Now)
 	r.config.Store(&cfg)
-	r.refreshAll(context.Background(), false)
+	r.refreshAll(context.Background())
 	return r, c
 }
 
@@ -287,7 +288,7 @@ func TestRejectedHeaderBlocksUntilAFreshRead(t *testing.T) {
 		t.Fatalf("picked %s after a refusal", got)
 	}
 	c.advance(time.Minute)
-	r.refreshAll(context.Background(), false)
+	r.refreshAll(context.Background())
 	if view := r.status().Accounts[0]; view.Refused {
 		t.Fatalf("a fresh read should clear the refusal: %#v", view)
 	}
@@ -478,15 +479,15 @@ func TestOnDemandRefreshDoesNotHammerAnUnreadableAccount(t *testing.T) {
 	}
 	c := &clock{now: testNow}
 	r := newPluginRuntime(host, fetch, c.Now)
-	r.refreshAll(context.Background(), false)
+	r.refreshAll(context.Background())
 	for i := 0; i < 5; i++ {
-		r.refreshAll(context.Background(), true)
+		r.refreshAll(context.Background())
 	}
 	if calls != 1 {
 		t.Fatalf("usage endpoint read %d times within the refresh gap, want 1", calls)
 	}
 	c.advance(minimumRefreshGap)
-	r.refreshAll(context.Background(), true)
+	r.refreshAll(context.Background())
 	if calls != 2 {
 		t.Fatalf("calls = %d after the gap, want 2", calls)
 	}
@@ -562,7 +563,7 @@ func TestRateLimitedAccountsBackOff(t *testing.T) {
 	r := newPluginRuntime(host, fetch, c.Now)
 	cfg := defaultPluginConfig()
 	r.config.Store(&cfg)
-	poll := func(onDemand bool) { r.refreshAll(context.Background(), onDemand) }
+	poll := func(bool) { r.refreshAll(context.Background()) }
 
 	poll(false) // 429: back off one poll interval
 	c.advance(time.Minute)
@@ -652,5 +653,97 @@ func waitUntil(t *testing.T, cond func() bool) {
 			t.Fatal("condition not met in time")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// countingRuntime is a runtime over one account whose usage reads are counted.
+func countingRuntime(t *testing.T, c *clock) (*pluginRuntime, *atomic.Int64) {
+	t.Helper()
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{{
+		ID: authIDFor("a@x.com"), AuthIndex: "1", Provider: "claude", Path: "/auth/a", Email: "a@x.com",
+	}}}
+	var reads atomic.Int64
+	fetch := func(context.Context, string, time.Duration) (usageResult, string) {
+		reads.Add(1)
+		return usageResult{Weekly: windowReading{Used: 10, ResetAt: c.Now().Add(72 * time.Hour)}}, ""
+	}
+	r := newPluginRuntime(host, fetch, c.Now)
+	cfg := defaultPluginConfig()
+	r.config.Store(&cfg)
+	return r, &reads
+}
+
+func TestHeaderFreshAccountsAreNotPolled(t *testing.T) {
+	c := &clock{now: testNow}
+	r, reads := countingRuntime(t, c)
+	r.refreshAll(context.Background())
+	for i := 0; i < 10; i++ { // 10 minutes of traffic keeping the reading fresh
+		c.advance(time.Minute)
+		r.handleUsage(usageRecord{AuthID: authIDFor("a@x.com"), ResponseHeaders: rateHeaders(0.10, 0.12)})
+		r.refreshAll(context.Background())
+	}
+	if reads.Load() != 1 {
+		t.Fatalf("usage endpoint read %d times for an account refreshed by headers, want 1", reads.Load())
+	}
+}
+
+func TestIdleAccountsArePolledOncePerInterval(t *testing.T) {
+	c := &clock{now: testNow}
+	r, reads := countingRuntime(t, c)
+	for i := 0; i < 20; i++ { // 10 minutes of 30s checks, no traffic
+		r.refreshAll(context.Background())
+		c.advance(30 * time.Second)
+	}
+	if got := reads.Load(); got != 5 {
+		t.Fatalf("idle account read %d times in 10 minutes at a 2m interval, want 5", got)
+	}
+}
+
+func TestRolledOverWindowIsReadPromptly(t *testing.T) {
+	c := &clock{now: testNow}
+	r, reads := countingRuntime(t, c)
+	r.refreshAll(context.Background())
+	r.handleUsage(usageRecord{AuthID: authIDFor("a@x.com"), ResponseHeaders: func() http.Header {
+		h := rateHeaders(0.50, 0.10)
+		h.Set(rateLimitHeaderPrefix+"5h-Reset", fmt.Sprint(c.Now().Add(time.Minute).Unix()))
+		return h
+	}()})
+	c.advance(61 * time.Second) // the 5h window resets; the reading is only a minute old
+	r.refreshAll(context.Background())
+	if reads.Load() != 2 {
+		t.Fatalf("a rolled-over window was not re-read: %d reads", reads.Load())
+	}
+}
+
+func TestReadingsSurviveARestart(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state.json")
+	c := &clock{now: testNow}
+	first, firstReads := countingRuntime(t, c)
+	first.stateFile = state
+	first.refreshAll(context.Background())
+	first.saveState()
+	if firstReads.Load() != 1 {
+		t.Fatalf("setup read %d times", firstReads.Load())
+	}
+	raw, _ := os.ReadFile(state)
+	if strings.Contains(string(raw), "token") {
+		t.Fatalf("state file must not hold credentials: %s", raw)
+	}
+
+	c.advance(30 * time.Second)
+	second, secondReads := countingRuntime(t, c)
+	second.stateFile = state
+	second.loadState()
+	second.refreshAll(context.Background())
+	if secondReads.Load() != 0 {
+		t.Fatalf("restart re-read a fresh cached reading %d times", secondReads.Load())
+	}
+	if got := mustPick(t, second, "", "a@x.com"); got != "a@x.com" {
+		t.Fatalf("restored reading not routable: %s", got)
+	}
+	c.advance(2 * time.Minute)
+	second.refreshAll(context.Background())
+	if secondReads.Load() != 1 {
+		t.Fatalf("stale restored reading was not refreshed: %d", secondReads.Load())
 	}
 }

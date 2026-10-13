@@ -33,10 +33,18 @@ every account toward the same remaining usage.
   cache stays warm. A conversation moves on its next request once its account
   reaches a ceiling, or once another account has `rebalance-margin` more
   points of headroom. Moving costs one cold prompt cache.
-- **Readings** come from Anthropic's usage endpoint every `poll-interval`, and
-  from the rate-limit headers on every proxied response in between, so the
-  account carrying traffic updates continuously. A `rejected` window status or
-  an upstream 429 blocks the account until a fresh read.
+- **Readings are cached first.** The rate-limit headers on every proxied
+  response refresh the account that served it, so busy accounts stay fresh
+  without extra calls. Anthropic's usage endpoint is read only for an account
+  whose reading is older than `poll-interval` (idle accounts, which catch an
+  owner using the account directly), missing, refused, or past a window reset.
+  A 429 from the usage endpoint backs that account off (Retry-After, else
+  doubling from `poll-interval` up to 15m). A `rejected` window status or an
+  upstream 429 on a request blocks the account until a fresh read.
+- **Readings persist** in `~/.cache/cpa-quota-balancer/state.json` (no
+  credentials), so a restart or plugin reload starts from cached data and
+  reads only what is stale. CLIProxyAPI keeps a reloaded plugin's old versions
+  loaded; superseded instances notice a newer one and stop polling.
 
 Overshoot is bounded, not zero: requests already in flight when an account
 crosses its ceiling still complete. Leave a little room in the ceiling for that.

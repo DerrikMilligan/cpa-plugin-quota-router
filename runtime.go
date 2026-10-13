@@ -29,9 +29,13 @@ type claudeCredential struct {
 	AccessToken string `json:"access_token"`
 }
 
-// minimumRefreshGap keeps on-demand refreshes (refusals, new accounts) from
-// re-reading an account more often than this.
-const minimumRefreshGap = 20 * time.Second
+const (
+	// minimumRefreshGap keeps missing, refused or rolled-over readings from
+	// being re-read more often than this.
+	minimumRefreshGap = 20 * time.Second
+	// maxCheckInterval is how often the worker looks for stale readings.
+	maxCheckInterval = 30 * time.Second
+)
 
 type pluginRuntime struct {
 	lifecycleMu sync.Mutex
@@ -52,6 +56,11 @@ type pluginRuntime struct {
 	// marker and stops once a newer instance has claimed it. Empty disables it.
 	instanceMarker string
 	instanceToken  []byte
+	// stateFile keeps readings across host restarts and plugin reloads so a
+	// start reads only what is stale. Empty disables it.
+	stateFile    string
+	stateLoaded  bool
+	savedVersion uint64
 	// pollMu guards pollDone, which is closed and replaced after every
 	// refresh pass so picks can wait for fresh readings.
 	pollMu   sync.Mutex
@@ -143,6 +152,7 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 		// Restart so a changed poll interval takes effect at once.
 		r.stopLocked()
 	}
+	r.loadState()
 	ctx, cancel := context.WithCancel(context.Background())
 	r.wake, r.cancel, r.done = make(chan struct{}, 1), cancel, make(chan struct{})
 	go r.refreshLoop(ctx, cfg.PollInterval, r.wake, r.done)
@@ -195,29 +205,53 @@ func (r *pluginRuntime) waitForPoll(timeout time.Duration) {
 	}
 }
 
+// refreshLoop checks every account each tick and reads only the ones whose
+// cached reading is missing or out of date (see needsRead).
 func (r *pluginRuntime) refreshLoop(ctx context.Context, interval time.Duration, wake <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(min(interval, maxCheckInterval))
 	defer ticker.Stop()
-	onDemand := false
 	for {
 		if r.superseded() {
 			r.log("info", "quota balancer superseded by a newer plugin instance; polling stopped", nil)
 			return
 		}
-		r.refreshAll(ctx, onDemand)
+		r.refreshAll(ctx)
+		r.saveState()
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			onDemand = false
 		case <-wake:
-			onDemand = true
 		}
 	}
 }
 
-func (r *pluginRuntime) refreshAll(ctx context.Context, onDemand bool) {
+// needsRead decides whether an account's cached reading is worth replacing
+// with a usage-endpoint read. Readings refreshed by response headers count as
+// fresh, so accounts carrying traffic are rarely read; missing, refused or
+// rolled-over readings are read promptly; rate-limited accounts wait.
+func needsRead(s quotaSample, now time.Time, pollInterval time.Duration) bool {
+	if now.Before(s.BackoffUntil) {
+		return false
+	}
+	sinceAttempt := now.Sub(s.LastAttemptAt)
+	switch {
+	case !s.HasSample, s.refused():
+		return sinceAttempt >= minimumRefreshGap
+	case windowRolledOver(s.FiveHour, s, now), windowRolledOver(s.Weekly, s, now):
+		return sinceAttempt >= minimumRefreshGap
+	default:
+		return now.Sub(s.seenAt()) >= pollInterval && sinceAttempt >= pollInterval
+	}
+}
+
+// windowRolledOver reports a window whose reset passed after the reading was taken.
+func windowRolledOver(w windowReading, s quotaSample, now time.Time) bool {
+	return !w.ResetAt.IsZero() && !now.Before(w.ResetAt) && s.seenAt().Before(w.ResetAt)
+}
+
+func (r *pluginRuntime) refreshAll(ctx context.Context) {
 	defer func() {
 		r.pollMu.Lock()
 		close(r.pollDone)
@@ -240,13 +274,9 @@ func (r *pluginRuntime) refreshAll(ctx context.Context, onDemand bool) {
 			return
 		}
 		sample, _ := r.cache.snapshot(auth.ID)
-		if r.now().Before(sample.BackoffUntil) {
-			continue
+		if needsRead(sample, r.now(), cfg.PollInterval) {
+			r.pollAuth(ctx, auth, cfg)
 		}
-		if onDemand && r.now().Sub(sample.LastAttemptAt) < minimumRefreshGap {
-			continue
-		}
-		r.pollAuth(ctx, auth, cfg)
 	}
 }
 

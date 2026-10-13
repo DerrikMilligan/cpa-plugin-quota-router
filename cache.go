@@ -55,6 +55,8 @@ func (s quotaSample) refused() bool {
 type quotaCache struct {
 	mu      sync.Mutex
 	samples map[string]quotaSample
+	// version counts changes so the state file is written only when needed.
+	version uint64
 }
 
 func (c *quotaCache) reconcile(auths []physicalClaudeAuth) {
@@ -91,6 +93,7 @@ func (c *quotaCache) update(authID string, apply func(*quotaSample)) {
 	sample := c.samples[authID]
 	apply(&sample)
 	c.samples[authID] = sample
+	c.version++
 	c.mu.Unlock()
 }
 
@@ -171,6 +174,12 @@ func (c *quotaCache) snapshot(authID string) (quotaSample, bool) {
 	defer c.mu.Unlock()
 	sample, ok := c.samples[authID]
 	return sample, ok
+}
+
+func (c *quotaCache) currentVersion() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.version
 }
 
 func (c *quotaCache) all() map[string]quotaSample {
