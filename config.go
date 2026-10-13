@@ -79,16 +79,22 @@ func defaultPluginConfig() pluginConfig {
 // ceilingsFor resolves an account's ceilings: an override keyed by email wins
 // over one keyed by auth ID or file name, and unset fields keep the default.
 func (c pluginConfig) ceilingsFor(email, authID, name string) ceilings {
+	resolved, _ := c.accountCeilings(email, authID, name)
+	return resolved
+}
+
+// accountCeilings also reports whether an accounts entry set the ceilings.
+func (c pluginConfig) accountCeilings(email, authID, name string) (ceilings, bool) {
 	for _, key := range []string{email, authID, name} {
 		key = strings.ToLower(strings.TrimSpace(key))
 		if key == "" {
 			continue
 		}
 		if override, ok := c.Accounts[key]; ok {
-			return override
+			return override, true
 		}
 	}
-	return c.Default
+	return c.Default, false
 }
 
 func (c pluginConfig) routesModel(model string) bool {
@@ -242,7 +248,18 @@ type registrationCapabilities struct {
 }
 
 type managementRegistrationResponse struct {
-	Routes []managementRoute `json:"routes"`
+	Routes    []managementRoute `json:"routes"`
+	Resources []resourceRoute   `json:"resources"`
+}
+
+// resourceRoute is a browser page under /v0/resource/plugins/<id>/; Menu adds
+// it to the Management Center sidebar. Resource requests carry no management
+// authentication, so the page holds no data and reads everything through the
+// authenticated management API.
+type resourceRoute struct {
+	Path        string `json:"path"`
+	Menu        string `json:"menu,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 type managementRoute struct {
@@ -251,10 +268,14 @@ type managementRoute struct {
 }
 
 func managementRegistration() managementRegistrationResponse {
-	return managementRegistrationResponse{Routes: []managementRoute{{
-		Method: http.MethodGet,
-		Path:   managementStatusRoute,
-	}}}
+	return managementRegistrationResponse{
+		Routes: []managementRoute{{Method: http.MethodGet, Path: managementStatusRoute}},
+		Resources: []resourceRoute{{
+			Path:        uiResourcePath,
+			Menu:        "Quota Balancer",
+			Description: "Per-account 5-hour and weekly usage against ceilings, with editable per-account ceilings.",
+		}},
+	}
 }
 
 func pluginRegistration() registration {

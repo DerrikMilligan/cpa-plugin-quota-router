@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quota Balancer</title>
+<style>
+  :root {
+    --bg: #f7f7f8; --panel: #ffffff; --text: #18181b; --muted: #71717a; --line: #e4e4e7;
+    --track: #ececef; --ok: #16a34a; --warn: #d97706; --bad: #dc2626; --accent: #2563eb;
+    --pill-ok: #dcfce7; --pill-bad: #fee2e2; --pill-ok-text: #166534; --pill-bad-text: #991b1b;
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1115; --panel: #171a21; --text: #e4e4e7; --muted: #9ca3af; --line: #272b35;
+    --track: #262a33; --ok: #22c55e; --warn: #f59e0b; --bad: #f87171; --accent: #60a5fa;
+    --pill-ok: #14321f; --pill-bad: #3b1717; --pill-ok-text: #86efac; --pill-bad-text: #fca5a5;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; margin-bottom: 14px; }
+  h1 { font-size: 18px; margin: 0; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .meta b { color: var(--text); font-weight: 600; }
+  .toolbar { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+           border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; min-width: 980px; }
+  th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
+  th { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+  tr:last-child td { border-bottom: 0; }
+  .acct { font-weight: 600; }
+  .sub { color: var(--muted); font-size: 12px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .pill.ok { background: var(--pill-ok); color: var(--pill-ok-text); }
+  .pill.bad { background: var(--pill-bad); color: var(--pill-bad-text); }
+  .bar { position: relative; width: 170px; height: 10px; border-radius: 5px; background: var(--track); }
+  .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; }
+  .ceil { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); opacity: .7; }
+  .barline { display: flex; align-items: center; gap: 8px; }
+  .num { font-variant-numeric: tabular-nums; }
+  .headroom { font-size: 16px; font-weight: 700; }
+  .edit { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .edit label { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
+  .edit input { width: 58px; font: inherit; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px;
+                background: var(--bg); color: var(--text); }
+  .edit input.dirty { border-color: var(--accent); }
+  .tag { font-size: 11px; color: var(--accent); font-weight: 600; }
+  #notice { margin: 0 0 12px; padding: 8px 12px; border-radius: 8px; display: none; }
+  #notice.show { display: block; }
+  #notice.error { background: var(--pill-bad); color: var(--pill-bad-text); }
+  #notice.info { background: var(--pill-ok); color: var(--pill-ok-text); }
+  #login { display: none; max-width: 420px; background: var(--panel); border: 1px solid var(--line);
+           border-radius: 10px; padding: 16px; }
+  #login input { width: 100%; margin: 8px 0; font: inherit; padding: 6px 8px; border: 1px solid var(--line);
+                 border-radius: 6px; background: var(--bg); color: var(--text); }
+  .help { color: var(--muted); font-size: 12px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Quota Balancer</h1>
+  <span class="meta" id="summary"></span>
+  <div class="toolbar">
+    <span class="meta" id="updated"></span>
+    <button id="refresh" type="button">Refresh</button>
+  </div>
+</header>
+<div id="notice"></div>
+<form id="login">
+  <b>Management key</b>
+  <div class="sub">The Management Center did not remember its key, so enter it once for this browser session.</div>
+  <input id="key" type="password" autocomplete="current-password" placeholder="Management key">
+  <button class="primary" type="submit">Connect</button>
+</form>
+<div class="card" id="card" hidden>
+  <table>
+    <thead>
+      <tr>
+        <th>Account</th><th>Status</th><th>5-hour</th><th>Weekly</th>
+        <th>Headroom</th><th>Live</th><th>Ceilings (percent used)</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+<p class="help">
+  Headroom is the smaller of the two windows' points left under the ceiling; new conversations go to the
+  account with the most. The dark tick on each bar is the ceiling. Blank ceiling inputs use the defaults.
+  Saving writes the <code>accounts</code> entry in the plugin config and applies at once.
+</p>
+<script>
+(() => {
+  "use strict";
+  const PLUGIN = "quota-balancer";
+  const API = "/v0/management";
+  const STATUS = API + "/plugins/" + PLUGIN + "/status";
+  const CONFIG = API + "/plugins/" + PLUGIN + "/config";
+  const SESSION_KEY = PLUGIN + "::management-key";
+  const REFRESH_MS = 15000;
+  let key = "";
+  let timer = null;
+  let editing = false;
+
+  // Theme: follow the Management Center when it saved one, else the OS.
+  try {
+    const raw = localStorage.getItem("cli-proxy-theme");
+    const parsed = raw ? JSON.parse(raw) : null;
+    const theme = parsed && parsed.state ? parsed.state.theme : parsed;
+    const dark = theme === "dark" || (theme !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+  } catch (_) {
+    document.documentElement.dataset.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+
+  // The Management Center keeps its key (when "remember" is on) XOR-obfuscated
+  // in localStorage under cli-proxy-auth; this page shares its origin.
+  function panelKey() {
+    try {
+      const raw = localStorage.getItem("cli-proxy-auth");
+      if (!raw) return "";
+      let json = raw;
+      const prefix = "enc::v1::";
+      if (raw.startsWith(prefix)) {
+        const mask = new TextEncoder().encode("cli-proxy-api-webui::secure-storage|" + location.host + "|" + navigator.userAgent);
+        const bin = atob(raw.slice(prefix.length));
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) ^ mask[i % mask.length];
+        json = new TextDecoder().decode(out);
+      }
+      const parsed = JSON.parse(json);
+      const state = parsed.state || parsed;
+      return typeof state.managementKey === "string" ? state.managementKey : "";
+    } catch (_) {
+      return "";
+    }
+  }
+
+  async function api(method, url, body) {
+    const res = await fetch(url, {
+      method,
+      headers: Object.assign({ Authorization: "Bearer " + key },
+        body === undefined ? {} : { "Content-Type": "application/json" }),
+      body: body === undefined ? undefined : JSON.stringify(body),
+      cache: "no-store",
+    });
+    if (res.status === 401 || res.status === 403) throw Object.assign(new Error("unauthorized"), { auth: true });
+    if (!res.ok) throw new Error(method + " " + url + " failed: HTTP " + res.status);
+    return res.status === 204 ? null : res.json();
+  }
+
+  function el(tag, attrs, ...children) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (k === "class") node.className = v;
+      else if (k === "style") node.setAttribute("style", v);
+      else node[k] = v;
+    }
+    for (const child of children) {
+      if (child == null) continue;
+      node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+    }
+    return node;
+  }
+
+  function notice(text, kind) {
+    const box = document.getElementById("notice");
+    box.textContent = text || "";
+    box.className = text ? "show " + (kind || "info") : "";
+  }
+
+  function until(iso) {
+    if (!iso) return "";
+    const ms = Date.parse(iso) - Date.now();
+    if (!(ms > 0)) return "reset";
+    const m = Math.round(ms / 60000), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60;
+    return "resets in " + (d ? d + "d " + h + "h" : h ? h + "h " + mm + "m" : mm + "m");
+  }
+
+  function ago(iso) {
+    if (!iso) return "never read";
+    const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+    return "read " + (s < 90 ? s + "s" : Math.round(s / 60) + "m") + " ago";
+  }
+
+  function bar(used, ceiling, resetAt, known) {
+    const ratio = ceiling > 0 ? used / ceiling : 1;
+    const color = ratio >= 1 ? "var(--bad)" : ratio >= 0.8 ? "var(--warn)" : "var(--ok)";
+    const track = el("div", { class: "bar", title: used.toFixed(1) + "% used of a " + ceiling + "% ceiling" },
+      el("div", { class: "fill", style: "width:" + Math.min(100, Math.max(0, used)) + "%;background:" + color }),
+      el("div", { class: "ceil", style: "left:calc(" + Math.min(100, ceiling) + "% - 1px)" }));
+    return el("div", {},
+      el("div", { class: "barline" }, track,
+        el("span", { class: "num" }, known ? Math.round(used) + "% / " + ceiling + "%" : "-")),
+      el("div", { class: "sub" }, known ? until(resetAt) : ""));
+  }
+
+  function ceilingInput(label, value, fallback) {
+    const input = el("input", { type: "number", min: "1", max: "100", step: "1", placeholder: String(fallback) });
+    if (value !== null) input.value = String(value);
+    input.dataset.initial = input.value;
+    input.addEventListener("input", () => {
+      input.classList.toggle("dirty", input.value !== input.dataset.initial);
+      editing = Array.from(document.querySelectorAll(".edit input")).some(i => i.value !== i.dataset.initial);
+    });
+    return { input, wrap: el("label", {}, label, input) };
+  }
+
+  function row(account, defaults) {
+    const known = account.known;
+    const status = account.eligible
+      ? el("span", { class: "pill ok" }, "routing")
+      : el("span", { class: "pill bad", title: account.reason || "" }, "held");
+    const five = ceilingInput("5h", account.override ? account.ceilings.five_hour : null, defaults.five_hour);
+    const week = ceilingInput("wk", account.override ? account.ceilings.weekly : null, defaults.weekly);
+    const save = el("button", { type: "button", class: "primary" }, "Save");
+    const reset = el("button", { type: "button", disabled: !account.override, title: "Remove this account's entry" }, "Use defaults");
+    save.addEventListener("click", () => saveCeilings(account.email || account.id, five.input.value, week.input.value, save));
+    reset.addEventListener("click", () => saveCeilings(account.email || account.id, "", "", reset));
+    return el("tr", {},
+      el("td", {},
+        el("div", { class: "acct" }, account.email || account.id),
+        el("div", { class: "sub" }, ago(account.seen_at), account.last_error ? " - " + account.last_error : "")),
+      el("td", {}, status, account.eligible ? null : el("div", { class: "sub" }, account.reason || "")),
+      el("td", {}, bar(account.five_hour_used, account.ceilings.five_hour, account.five_hour_reset_at, known)),
+      el("td", {}, bar(account.weekly_used, account.ceilings.weekly, account.weekly_reset_at, known)),
+      el("td", { class: "num headroom" }, known ? Math.max(0, Math.round(account.headroom)) : "-"),
+      el("td", { class: "num" }, account.live_sessions),
+      el("td", {},
+        el("div", { class: "edit" }, five.wrap, week.wrap, save, reset,
+          account.override ? el("span", { class: "tag" }, "custom") : null)));
+  }
+
+  async function load(force) {
+    if (editing && !force) return;
+    try {
+      const status = await api("GET", STATUS);
+      const d = status.default_ceilings;
+      document.getElementById("summary").replaceChildren(
+        "Defaults ", el("b", {}, d.five_hour + "% 5h"), " / ", el("b", {}, d.weekly + "% weekly"),
+        " - models ", el("b", {}, (status.models || []).join(", ")),
+        " - spread ", el("b", {}, status.spread_band), " - rebalance ", el("b", {}, status.rebalance_margin),
+        " - poll ", el("b", {}, status.poll_interval));
+      const accounts = (status.accounts || []).slice().sort((a, b) =>
+        (b.eligible - a.eligible) || (b.headroom - a.headroom) || String(a.email).localeCompare(String(b.email)));
+      document.getElementById("rows").replaceChildren(...accounts.map(a => row(a, d)));
+      document.getElementById("card").hidden = false;
+      document.getElementById("login").style.display = "none";
+      document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
+      editing = false;
+      if (!force) notice("");
+    } catch (err) {
+      if (err.auth) return askForKey("That key was not accepted.");
+      notice(err.message, "error");
+    }
+  }
+
+  async function saveCeilings(email, fiveRaw, weekRaw, button) {
+    const parse = (raw, name) => {
+      if (String(raw).trim() === "") return null;
+      const n = Number(raw);
+      if (!(n > 0 && n <= 100)) throw new Error(name + " must be above 0 and at most 100");
+      return n;
+    };
+    button.disabled = true;
+    try {
+      const five = parse(fiveRaw, "5-hour ceiling");
+      const week = parse(weekRaw, "Weekly ceiling");
+      // Read the raw config so other entries and unset fields are kept as written.
+      const config = await api("GET", CONFIG);
+      const accounts = Object.assign({}, config.accounts || {});
+      const target = email.toLowerCase();
+      for (const existing of Object.keys(accounts)) {
+        if (existing.toLowerCase() === target) delete accounts[existing];
+      }
+      if (five !== null || week !== null) {
+        const entry = {};
+        if (five !== null) entry["five-hour-ceiling"] = five;
+        if (week !== null) entry["weekly-ceiling"] = week;
+        accounts[target] = entry;
+      }
+      await api("PATCH", CONFIG, { accounts });
+      notice("Saved ceilings for " + email + ". The plugin applies them immediately.", "info");
+      editing = false;
+      setTimeout(() => load(true), 1200);
+    } catch (err) {
+      if (err.auth) return askForKey("That key was not accepted.");
+      notice(err.message, "error");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function askForKey(message) {
+    clearInterval(timer);
+    sessionStorage.removeItem(SESSION_KEY);
+    document.getElementById("card").hidden = true;
+    document.getElementById("login").style.display = "block";
+    if (message) notice(message, "error");
+  }
+
+  document.getElementById("login").addEventListener("submit", (event) => {
+    event.preventDefault();
+    key = document.getElementById("key").value.trim();
+    if (!key) return;
+    sessionStorage.setItem(SESSION_KEY, key);
+    start();
+  });
+  document.getElementById("refresh").addEventListener("click", () => { editing = false; load(true); });
+
+  function start() {
+    clearInterval(timer);
+    load(true);
+    timer = setInterval(load, REFRESH_MS);
+  }
+
+  key = panelKey() || sessionStorage.getItem(SESSION_KEY) || "";
+  if (key) start(); else askForKey("");
+})();
+</script>
+</body>
+</html>

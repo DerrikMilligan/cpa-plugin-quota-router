@@ -20,6 +20,7 @@ const (
 	exhaustedErrorCode         = "quota_balancer_exhausted"
 	managementStatusRoute      = "/plugins/quota-balancer/status"
 	managementStatusFullPath   = "/v0/management" + managementStatusRoute
+	uiResourcePath             = "/v0/resource/plugins/" + pluginName + "/ui"
 	pollErrorAuthList          = "auth_list"
 	pollErrorAuthGet           = "auth_get"
 	pollErrorInvalidCredential = "invalid local credential"
@@ -38,7 +39,7 @@ const (
 	pollErrorRead              = "read_error"
 )
 
-var pluginVersion = "1.0.2"
+var pluginVersion = "1.1.0"
 
 // Variable only so the C-shared integration test can inject a local fixture.
 var usageEndpoint = defaultUsageEndpoint

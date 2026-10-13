@@ -500,3 +500,46 @@ func TestConfigFieldDescriptionsSurviveHTMLEscaping(t *testing.T) {
 		}
 	}
 }
+
+func TestSidebarPageIsStaticAndLocked(t *testing.T) {
+	r, _ := newTestRuntime(t, defaultPluginConfig(), map[string][2]float64{"secret-person@x.com": {10, 10}})
+	resp := r.handleManagement(pluginapi.ManagementRequest{Method: http.MethodGet, Path: uiResourcePath})
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Headers.Get("Content-Type"), "text/html") {
+		t.Fatalf("ui route: status=%d headers=%v", resp.StatusCode, resp.Headers)
+	}
+	csp := resp.Headers.Get("Content-Security-Policy")
+	for _, want := range []string{"default-src 'none'", "connect-src 'self'", "frame-ancestors 'self'"} {
+		if !strings.Contains(csp, want) {
+			t.Errorf("CSP %q lacks %q", csp, want)
+		}
+	}
+	// Resource routes are unauthenticated: the page must not carry account data.
+	if strings.Contains(string(resp.Body), "secret-person") {
+		t.Fatalf("the unauthenticated page embedded account data")
+	}
+	status := r.handleManagement(pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v8/management" + managementStatusRoute})
+	if status.StatusCode != http.StatusOK || !strings.Contains(string(status.Body), "secret-person@x.com") {
+		t.Fatalf("status route: %d %s", status.StatusCode, status.Body)
+	}
+	if missing := r.handleManagement(pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/quota-balancer/other"}); missing.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown path served %d", missing.StatusCode)
+	}
+}
+
+func TestRegistrationAddsTheSidebarMenu(t *testing.T) {
+	reg := managementRegistration()
+	if len(reg.Resources) != 1 || reg.Resources[0].Path != uiResourcePath || reg.Resources[0].Menu == "" {
+		t.Fatalf("resources = %#v", reg.Resources)
+	}
+}
+
+func TestStatusMarksOverriddenAccounts(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.Accounts = map[string]ceilings{"a@x.com": {FiveHour: 70, Weekly: 90}}
+	r, _ := newTestRuntime(t, cfg, map[string][2]float64{"a@x.com": {0, 0}, "b@x.com": {0, 0}})
+	for _, account := range r.status().Accounts {
+		if want := account.Email == "a@x.com"; account.Override != want {
+			t.Errorf("%s override = %v, want %v", account.Email, account.Override, want)
+		}
+	}
+}

@@ -64,11 +64,13 @@ type accountView struct {
 	Email    string   `json:"email,omitempty"`
 	Name     string   `json:"name,omitempty"`
 	Ceilings ceilings `json:"ceilings"`
-	Known    bool     `json:"known"`
-	Fresh    bool     `json:"fresh"`
-	Refused  bool     `json:"refused,omitempty"`
-	FiveHour float64  `json:"five_hour_used"`
-	Weekly   float64  `json:"weekly_used"`
+	// Override reports ceilings set by an accounts entry, not the defaults.
+	Override bool    `json:"override"`
+	Known    bool    `json:"known"`
+	Fresh    bool    `json:"fresh"`
+	Refused  bool    `json:"refused,omitempty"`
+	FiveHour float64 `json:"five_hour_used"`
+	Weekly   float64 `json:"weekly_used"`
 	// Headroom is the smaller of the two windows' points left under the ceiling.
 	Headroom        float64 `json:"headroom"`
 	Eligible        bool    `json:"eligible"`
@@ -81,11 +83,13 @@ type accountView struct {
 }
 
 func evaluate(authID string, sample quotaSample, cfg pluginConfig, now time.Time) accountView {
+	resolved, override := cfg.accountCeilings(sample.Email, authID, sample.Name)
 	view := accountView{
 		ID:        authID,
 		Email:     sample.Email,
 		Name:      sample.Name,
-		Ceilings:  cfg.ceilingsFor(sample.Email, authID, sample.Name),
+		Ceilings:  resolved,
+		Override:  override,
 		Known:     sample.HasSample,
 		Fresh:     sample.fresh(now, cfg.MaxStaleness),
 		Refused:   sample.refused(),
@@ -292,11 +296,29 @@ func (r *pluginRuntime) status() statusResponse {
 }
 
 func (r *pluginRuntime) handleManagement(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	headers := http.Header{"Content-Type": []string{"application/json; charset=utf-8"}}
-	if !strings.EqualFold(strings.TrimSpace(req.Method), http.MethodGet) || !strings.HasSuffix(strings.TrimRight(strings.TrimSpace(req.Path), "/"), managementStatusRoute) {
+	path := strings.TrimRight(strings.TrimSpace(req.Path), "/")
+	get := strings.EqualFold(strings.TrimSpace(req.Method), http.MethodGet)
+	switch {
+	case get && path == uiResourcePath:
+		return pluginapi.ManagementResponse{
+			StatusCode: http.StatusOK,
+			Headers: http.Header{
+				"Content-Type":            []string{"text/html; charset=utf-8"},
+				"Cache-Control":           []string{"no-store"},
+				"X-Content-Type-Options":  []string{"nosniff"},
+				"Content-Security-Policy": []string{uiContentSecurityPolicy},
+			},
+			Body: uiPage,
+		}
+	case get && strings.HasSuffix(path, managementStatusRoute):
+		body, _ := json.Marshal(r.status())
+		return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: jsonHeaders(), Body: body}
+	default:
 		body, _ := json.Marshal(map[string]string{"error": "not found"})
-		return pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Headers: headers, Body: body}
+		return pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Headers: jsonHeaders(), Body: body}
 	}
-	body, _ := json.Marshal(r.status())
-	return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: headers, Body: body}
+}
+
+func jsonHeaders() http.Header {
+	return http.Header{"Content-Type": []string{"application/json; charset=utf-8"}}
 }

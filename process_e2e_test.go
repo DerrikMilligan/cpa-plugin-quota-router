@@ -189,6 +189,24 @@ plugins:
 	})
 	model := waitForProcessClaudeModel(t, client, baseURL, processDone, &processErr, logPath)
 
+	// The sidebar page is served without a key and listed as a menu entry.
+	page, err := client.Get(baseURL + uiResourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readResponseBody(t, page); page.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("<title>Quota Balancer</title>")) {
+		t.Fatalf("sidebar page: status=%d\nserver log:\n%s", page.StatusCode, readLog(logPath))
+	}
+	listRequest, _ := http.NewRequest(http.MethodGet, baseURL+"/v0/management/plugins", nil)
+	listRequest.Header.Set("Authorization", "Bearer "+e2eManagementKey)
+	listResponse, err := client.Do(listRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readResponseBody(t, listResponse); !bytes.Contains(body, []byte("Quota Balancer")) {
+		t.Fatalf("plugin list has no Quota Balancer menu: %s", body)
+	}
+
 	// A new conversation lands on the account with the most headroom (b: 70 vs a: 10).
 	routed := postClaudeMessage(t, client, baseURL, model, "e2e-session")
 	if bytes.Contains(routed, []byte(exhaustedErrorCode)) {

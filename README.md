@@ -78,6 +78,20 @@ Saving applies live. Field descriptions avoid quotes, apostrophes, `<`, `>`
 and `&`: the host HTML-escapes plugin metadata and the panel shows the
 entities literally.
 
+## Management Center page
+
+The plugin adds a **Quota Balancer** entry to the Management Center sidebar.
+It shows each account's 5-hour and weekly usage against its ceilings (the dark
+tick on each bar), headroom, live conversations, reset times, and why an
+account is held. Each row edits that account's ceilings in place; blank inputs
+use the defaults, and **Use defaults** removes the entry. Saving PATCHes the
+`accounts` config and applies at once.
+
+The page itself is static (resource routes are not management-authenticated)
+and reads everything through the management API. It reuses the Management
+Center's key when the panel remembered it, otherwise asks once per browser
+session.
+
 Status: `GET /v0/management/plugins/quota-balancer/status` (management key)
 lists each account's usage, ceilings, headroom, eligibility and live
 conversations.
