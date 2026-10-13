@@ -99,9 +99,10 @@ launch reset for Enterprise members). The usage read asks for them
 (`?cedar_ember=1`), so they cost no extra calls; every account gets a full
 read at least every 30 minutes and once after a restart to keep them current.
 
-Each card shows resets left, what a reset clears, when it expires, and a
-**Use reset** button when Anthropic marks it usable (some grants only work once
-the account is at its limit; the card says why when not). Using one calls
+Each card shows how many resets are left and when the soonest expires, with a
+**Use reset** button when Anthropic marks one usable (some grants only work
+once the account is at its limit; the card says why when not). The button
+opens a confirmation showing the grant, what it clears and the expiry. Using one calls
 `POST /api/organizations/<org>/reset_rate_limits` exactly as
 cpa-usage-keeper does, through the plugin route
 `POST /v0/management/plugins/quota-balancer/reset` (`{"account": "<email or
@@ -114,7 +115,7 @@ the cleared windows read 0 at once and a confirming read is queued.
 The plugin adds a **Quota Balancer** entry to the Management Center sidebar.
 One card per account shows its 5-hour and weekly usage against its ceilings
 (the dark tick on each bar), points left, headroom, live conversations, reset
-times, and why an account is held. **Edit ceilings** on a card sets that
+times, and why an account is held. **Edit ceilings** on a card opens a dialog for that
 account's ceilings; blank inputs use the defaults, and **Use defaults** removes
 the entry. Saving PATCHes the
 `accounts` config and applies at once.

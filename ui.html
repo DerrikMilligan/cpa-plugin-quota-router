@@ -59,21 +59,28 @@
   .ceil { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--text); opacity: .75; border-radius: 1px; }
   .window .foot { display: flex; justify-content: space-between; margin-top: 3px; }
   .reason { font-size: 13px; color: var(--pill-bad-text); }
-  .resets { border: 1px dashed var(--line); border-radius: 8px; padding: 8px 10px; display: flex;
-            align-items: center; gap: 10px; }
+  .resets { display: flex; align-items: center; gap: 10px; font-size: 13px; }
   .resets .what { flex: 1; min-width: 0; }
-  .resets .title { font-size: 13px; font-weight: 600; }
-  .resets .grant { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .resets button { white-space: nowrap; flex: none; }
+  .resets .count { font-weight: 600; }
+  .resets button { padding: 3px 10px; font-size: 13px; white-space: nowrap; flex: none; }
   .bottom { display: flex; justify-content: space-between; align-items: center; gap: 8px;
             border-top: 1px solid var(--line); padding-top: 10px; }
-  .edit { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-  .edit[hidden] { display: none; }
-  .edit label { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
-  .edit input { width: 60px; font: inherit; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px;
-                background: var(--bg); color: var(--text); }
-  .edit input.dirty { border-color: var(--accent); }
-  .edit button { padding: 3px 8px; font-size: 13px; }
+  dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text);
+           padding: 20px; width: min(420px, calc(100vw - 32px)); box-shadow: 0 20px 50px rgba(0,0,0,.35); }
+  dialog::backdrop { background: rgba(0, 0, 0, .45); }
+  dialog h2 { font-size: 16px; margin: 0 0 4px; }
+  dialog .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0 6px; }
+  dialog label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+  dialog input { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+                 background: var(--bg); color: var(--text); }
+  dialog dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 14px 0; font-size: 13px; }
+  dialog dt { color: var(--muted); }
+  dialog dd { margin: 0; font-weight: 600; }
+  dialog .warn { font-size: 13px; color: var(--pill-bad-text); background: var(--pill-bad); padding: 8px 10px; border-radius: 8px; }
+  dialog .error { font-size: 13px; color: var(--pill-bad-text); min-height: 18px; margin-top: 8px; }
+  dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+  dialog .actions .spacer { flex: 1; }
+  button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
   #notice { margin: 0 0 12px; padding: 8px 12px; border-radius: 8px; display: none; }
   #notice.show { display: block; }
   #notice.error { background: var(--pill-bad); color: var(--pill-bad-text); }
@@ -105,6 +112,33 @@
   <div class="stats" id="stats"></div>
   <div class="grid" id="cards"></div>
 </div>
+<dialog id="ceilingsDialog">
+  <form id="ceilingsForm" method="dialog">
+    <h2 id="ceilingsTitle">Ceilings</h2>
+    <div class="sub">Percent used at which this account stops taking requests. Leave a field blank to use the default.</div>
+    <div class="fields">
+      <label>5-hour ceiling (%)<input id="ceilFive" type="number" min="1" max="100" step="1"></label>
+      <label>Weekly ceiling (%)<input id="ceilWeek" type="number" min="1" max="100" step="1"></label>
+    </div>
+    <div class="error" id="ceilError"></div>
+    <div class="actions">
+      <button type="button" id="ceilDefaults">Use defaults</button>
+      <span class="spacer"></span>
+      <button type="button" id="ceilCancel">Cancel</button>
+      <button type="submit" class="primary" id="ceilSave">Save</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="resetDialog">
+  <h2>Use a usage-limit reset?</h2>
+  <dl id="resetDetails"></dl>
+  <div class="warn">This spends the reset with Anthropic and cannot be undone.</div>
+  <div class="error" id="resetError"></div>
+  <div class="actions">
+    <button type="button" id="resetCancel">Cancel</button>
+    <button type="button" class="danger" id="resetConfirm">Use reset</button>
+  </div>
+</dialog>
 <p class="help">
   Headroom is the smaller of the two windows' points left under the ceiling; new conversations go to the
   account with the most. The dark tick on each bar is the ceiling. Blank ceiling inputs use the defaults.
@@ -123,8 +157,7 @@
   const REFRESH_MS = 15000;
   let key = "";
   let timer = null;
-  let editing = false;
-  const openEditors = new Set();
+  let editing = false; // a modal is open; auto-refresh waits
 
   // Theme: follow the Management Center when it saved one, else the OS.
   try {
@@ -204,47 +237,134 @@
     return names.join(" + ") || "unknown windows";
   }
 
-  function resetsBlock(account, id) {
+  function shortDate(iso) {
+    return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric" });
+  }
+
+  function resetsLine(account, id) {
     const r = account.resets;
-    if (!r) return el("div", { class: "resets" }, el("div", { class: "what sub" }, "Resets: not read yet"));
-    if (!r.eligible) {
-      return el("div", { class: "resets" }, el("div", { class: "what sub" },
-        "Resets: not eligible" + (r.ineligible_reason ? " (" + decode(r.ineligible_reason) + ")" : "")));
-    }
-    const grant = r.grants.find(g => g.id === r.usable_grant_id) || r.grants.find(g => g.resets_left > 0) || r.grants[0];
-    const title = r.available + (r.available === 1 ? " reset left" : " resets left");
-    if (!grant) return el("div", { class: "resets" }, el("div", { class: "what sub" }, "Resets: none available"));
-    const ends = grant.ends_at ? "expires " + new Date(grant.ends_at).toLocaleDateString([], { month: "short", day: "numeric" }) : "";
-    const usable = r.usable_grant_id === grant.id;
-    const button = el("button", { type: "button", class: usable ? "primary" : "", disabled: !usable,
-      title: usable ? "Spend this reset now" : decode(grant.unusable || "not usable now") }, "Use reset");
-    button.addEventListener("click", () => useReset(account, id, grant, r.available, button));
+    const line = (...parts) => el("div", { class: "resets" }, el("div", { class: "what sub" }, ...parts));
+    if (!r) return line("Resets: not read yet");
+    if (!r.eligible) return line("Resets: not eligible" + (r.ineligible_reason ? " (" + decode(r.ineligible_reason) + ")" : ""));
+    const live = r.grants.filter(g => g.resets_left > 0);
+    if (!r.available || !live.length) return line("No resets left");
+    const soonest = live.filter(g => g.ends_at).map(g => g.ends_at).sort()[0];
+    const grant = r.grants.find(g => g.id === r.usable_grant_id);
+    const blocked = grant ? "" : decode((live[0] && live[0].unusable) || "not usable now");
+    const button = el("button", { type: "button", class: grant ? "primary" : "", disabled: !grant,
+      title: grant ? "Spend a reset on this account" : blocked }, "Use reset");
+    button.addEventListener("click", () => openReset(account, id, grant, r.available));
     return el("div", { class: "resets" },
       el("div", { class: "what" },
-        el("div", { class: "title" }, title),
-        el("div", { class: "sub" }, "Clears " + clearsText(grant.clears) + (ends ? " - " + ends : "")),
-        el("div", { class: "grant", title: decode(grant.label) }, usable ? decode(grant.label) : decode(grant.unusable || "") + " - " + decode(grant.label))),
+        el("span", { class: "count" }, r.available + (r.available === 1 ? " reset" : " resets")),
+        el("span", { class: "sub" }, (soonest ? " - expires " + shortDate(soonest) : "") + (blocked ? " - " + blocked : ""))),
       button);
   }
 
-  async function useReset(account, id, grant, available, button) {
-    const message = "Use 1 usage-limit reset on " + id + "?\n\n" + decode(grant.label) +
-      "\nClears: " + clearsText(grant.clears) +
-      "\nResets left after this: " + Math.max(0, available - 1) +
-      "\n\nThis spends the reset with Anthropic and cannot be undone.";
-    if (!confirm(message)) return;
-    button.disabled = true;
+  // ---- Reset confirmation modal
+  const resetDialog = document.getElementById("resetDialog");
+  let resetTarget = null;
+
+  function openReset(account, id, grant, available) {
+    resetTarget = { account, id, grant };
+    const rows = [
+      ["Account", id],
+      ["Grant", decode(grant.label) || grant.id],
+      ["Clears", clearsText(grant.clears)],
+      ["Expires", grant.ends_at ? shortDate(grant.ends_at) : "not stated"],
+      ["Left after", String(Math.max(0, available - 1))],
+    ];
+    document.getElementById("resetDetails").replaceChildren(...rows.flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, v)]));
+    document.getElementById("resetError").textContent = "";
+    setResetBusy(false);
+    editing = true;
+    resetDialog.showModal();
+    document.getElementById("resetCancel").focus();
+  }
+
+  function setResetBusy(busy) {
+    const confirmButton = document.getElementById("resetConfirm");
+    confirmButton.disabled = busy;
+    confirmButton.textContent = busy ? "Using reset..." : "Use reset";
+    document.getElementById("resetCancel").disabled = busy;
+  }
+
+  document.getElementById("resetCancel").addEventListener("click", () => resetDialog.close());
+  resetDialog.addEventListener("cancel", (event) => { if (document.getElementById("resetConfirm").disabled) event.preventDefault(); });
+  resetDialog.addEventListener("close", () => { editing = false; resetTarget = null; });
+  document.getElementById("resetConfirm").addEventListener("click", async () => {
+    if (!resetTarget) return;
+    const { account, id, grant } = resetTarget;
+    setResetBusy(true);
     try {
       const out = await api("POST", RESET, { account: account.id, grant_id: grant.id });
       const ok = out.result === "reset" || out.result === "already_used";
       notice(id + ": " + decode(out.message || out.result), ok ? "info" : "error");
-      editing = false;
+    } catch (err) {
+      if (err.auth) { resetDialog.close(); return askForKey("That key was not accepted."); }
+      notice(id + ": " + err.message + ". The outcome is unknown; check this card after the next read before trying again.", "error");
+    }
+    setResetBusy(false);
+    resetDialog.close();
+    setTimeout(() => load(true), 1200);
+  });
+
+  // ---- Ceilings modal
+  const ceilingsDialog = document.getElementById("ceilingsDialog");
+  let ceilingsTarget = null;
+
+  function openCeilings(account, id, defaults) {
+    ceilingsTarget = id;
+    document.getElementById("ceilingsTitle").textContent = "Ceilings for " + id;
+    const five = document.getElementById("ceilFive"), week = document.getElementById("ceilWeek");
+    five.value = account.override ? String(account.ceilings.five_hour) : "";
+    week.value = account.override ? String(account.ceilings.weekly) : "";
+    five.placeholder = "default " + defaults.five_hour;
+    week.placeholder = "default " + defaults.weekly;
+    document.getElementById("ceilDefaults").disabled = !account.override;
+    document.getElementById("ceilError").textContent = "";
+    editing = true;
+    ceilingsDialog.showModal();
+    five.focus();
+  }
+
+  async function submitCeilings(fiveRaw, weekRaw, button) {
+    const errorBox = document.getElementById("ceilError");
+    const parse = (raw, name) => {
+      if (String(raw).trim() === "") return null;
+      const n = Number(raw);
+      if (!(n > 0 && n <= 100)) throw new Error(name + " must be above 0 and at most 100.");
+      return n;
+    };
+    let five, week;
+    try {
+      five = parse(fiveRaw, "5-hour ceiling");
+      week = parse(weekRaw, "Weekly ceiling");
+    } catch (err) {
+      errorBox.textContent = err.message;
+      return;
+    }
+    button.disabled = true;
+    try {
+      await saveCeilings(ceilingsTarget, five, week);
+      notice("Saved ceilings for " + ceilingsTarget + ". The plugin applies them immediately.", "info");
+      ceilingsDialog.close();
       setTimeout(() => load(true), 1200);
     } catch (err) {
-      if (err.auth) return askForKey("That key was not accepted.");
-      notice(err.message + ". The outcome is unknown; check this card after the next read before trying again.", "error");
+      if (err.auth) { ceilingsDialog.close(); return askForKey("That key was not accepted."); }
+      errorBox.textContent = err.message;
+    } finally {
+      button.disabled = false;
     }
   }
+
+  document.getElementById("ceilingsForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    submitCeilings(document.getElementById("ceilFive").value, document.getElementById("ceilWeek").value, document.getElementById("ceilSave"));
+  });
+  document.getElementById("ceilDefaults").addEventListener("click", () => submitCeilings("", "", document.getElementById("ceilDefaults")));
+  document.getElementById("ceilCancel").addEventListener("click", () => ceilingsDialog.close());
+  ceilingsDialog.addEventListener("close", () => { editing = false; ceilingsTarget = null; });
 
   function notice(text, kind) {
     const box = document.getElementById("notice");
@@ -281,34 +401,11 @@
         el("span", {}, known ? Math.max(0, Math.round(ceiling - used)) + " pts left" : "")));
   }
 
-  function ceilingInput(label, value, fallback) {
-    const input = el("input", { type: "number", min: "1", max: "100", step: "1", placeholder: String(fallback) });
-    if (value !== null) input.value = String(value);
-    input.dataset.initial = input.value;
-    input.addEventListener("input", () => {
-      input.classList.toggle("dirty", input.value !== input.dataset.initial);
-      editing = Array.from(document.querySelectorAll(".edit input")).some(i => i.value !== i.dataset.initial);
-    });
-    return { input, wrap: el("label", {}, label, input) };
-  }
-
   function card(account, defaults) {
     const id = account.email || account.id;
     const known = account.known;
-    const five = ceilingInput("5h", account.override ? account.ceilings.five_hour : null, defaults.five_hour);
-    const week = ceilingInput("Weekly", account.override ? account.ceilings.weekly : null, defaults.weekly);
-    const save = el("button", { type: "button", class: "primary" }, "Save");
-    const reset = el("button", { type: "button", disabled: !account.override, title: "Remove this account's entry" }, "Use defaults");
-    const editor = el("div", { class: "edit", hidden: !openEditors.has(id) }, five.wrap, week.wrap, save, reset);
-    const toggle = el("button", { type: "button", class: "link" }, openEditors.has(id) ? "Close" : "Edit ceilings");
-    toggle.addEventListener("click", () => {
-      const open = editor.hidden;
-      editor.hidden = !open;
-      toggle.textContent = open ? "Close" : "Edit ceilings";
-      if (open) openEditors.add(id); else openEditors.delete(id);
-    });
-    save.addEventListener("click", () => saveCeilings(id, five.input.value, week.input.value, save));
-    reset.addEventListener("click", () => saveCeilings(id, "", "", reset));
+    const edit = el("button", { type: "button", class: "link" }, "Edit ceilings");
+    edit.addEventListener("click", () => openCeilings(account, id, defaults));
 
     const read = [ago(account.seen_at)];
     if (account.last_error) read.push(account.last_error);
@@ -329,11 +426,10 @@
       account.eligible ? null : el("div", { class: "reason" }, decode(account.reason || "")),
       windowBar("5-hour", account.five_hour_used, account.ceilings.five_hour, account.five_hour_reset_at, known),
       windowBar("Weekly", account.weekly_used, account.ceilings.weekly, account.weekly_reset_at, known),
-      resetsBlock(account, id),
+      resetsLine(account, id),
       el("div", { class: "bottom" },
         el("span", { class: "sub" }, read.join(" - ")),
-        toggle),
-      editor);
+        edit));
   }
 
   function stat(value, label) {
@@ -363,7 +459,6 @@
       document.getElementById("content").hidden = false;
       document.getElementById("login").style.display = "none";
       document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
-      editing = false;
       if (!force) notice("");
     } catch (err) {
       if (err.auth) return askForKey("That key was not accepted.");
@@ -371,40 +466,21 @@
     }
   }
 
-  async function saveCeilings(email, fiveRaw, weekRaw, button) {
-    const parse = (raw, name) => {
-      if (String(raw).trim() === "") return null;
-      const n = Number(raw);
-      if (!(n > 0 && n <= 100)) throw new Error(name + " must be above 0 and at most 100");
-      return n;
-    };
-    button.disabled = true;
-    try {
-      const five = parse(fiveRaw, "5-hour ceiling");
-      const week = parse(weekRaw, "Weekly ceiling");
-      // Read the raw config so other entries and unset fields are kept as written.
-      const config = await api("GET", CONFIG);
-      const accounts = Object.assign({}, config.accounts || {});
-      const target = email.toLowerCase();
-      for (const existing of Object.keys(accounts)) {
-        if (existing.toLowerCase() === target) delete accounts[existing];
-      }
-      if (five !== null || week !== null) {
-        const entry = {};
-        if (five !== null) entry["five-hour-ceiling"] = five;
-        if (week !== null) entry["weekly-ceiling"] = week;
-        accounts[target] = entry;
-      }
-      await api("PATCH", CONFIG, { accounts });
-      notice("Saved ceilings for " + email + ". The plugin applies them immediately.", "info");
-      editing = false;
-      setTimeout(() => load(true), 1200);
-    } catch (err) {
-      if (err.auth) return askForKey("That key was not accepted.");
-      notice(err.message, "error");
-    } finally {
-      button.disabled = false;
+  // Reads the raw config so other entries and unset fields are kept as written.
+  async function saveCeilings(email, five, week) {
+    const config = await api("GET", CONFIG);
+    const accounts = Object.assign({}, config.accounts || {});
+    const target = email.toLowerCase();
+    for (const existing of Object.keys(accounts)) {
+      if (existing.toLowerCase() === target) delete accounts[existing];
     }
+    if (five !== null || week !== null) {
+      const entry = {};
+      if (five !== null) entry["five-hour-ceiling"] = five;
+      if (week !== null) entry["weekly-ceiling"] = week;
+      accounts[target] = entry;
+    }
+    await api("PATCH", CONFIG, { accounts });
   }
 
   function askForKey(message) {
@@ -422,7 +498,7 @@
     sessionStorage.setItem(SESSION_KEY, key);
     start();
   });
-  document.getElementById("refresh").addEventListener("click", () => { editing = false; load(true); });
+  document.getElementById("refresh").addEventListener("click", () => load(true));
 
   function start() {
     clearInterval(timer);
