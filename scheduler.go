@@ -80,6 +80,7 @@ type accountView struct {
 	WeeklyResetAt   string  `json:"weekly_reset_at,omitempty"`
 	SeenAt          string  `json:"seen_at,omitempty"`
 	LastError       string  `json:"last_error,omitempty"`
+	BackoffUntil    string  `json:"backoff_until,omitempty"`
 }
 
 func evaluate(authID string, sample quotaSample, cfg pluginConfig, now time.Time) accountView {
@@ -94,6 +95,9 @@ func evaluate(authID string, sample quotaSample, cfg pluginConfig, now time.Time
 		Fresh:     sample.fresh(now, cfg.MaxStaleness),
 		Refused:   sample.refused(),
 		LastError: sample.LastErrorCategory,
+	}
+	if now.Before(sample.BackoffUntil) {
+		view.BackoffUntil = formatTime(sample.BackoffUntil)
 	}
 	if !sample.HasSample {
 		view.Reason = "no usage reading yet"

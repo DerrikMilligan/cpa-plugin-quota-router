@@ -14,6 +14,7 @@ const (
 	defaultRebalanceMargin     = 25.0
 	defaultMaxSessions         = 65536
 	minimumPollInterval        = 30 * time.Second
+	maxRateLimitBackoff        = 15 * time.Minute
 	defaultUsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
 	anthropicOAuthBeta         = "oauth-2025-04-20"
 	maxUsageResponseBytes      = 64 << 10
@@ -39,7 +40,7 @@ const (
 	pollErrorRead              = "read_error"
 )
 
-var pluginVersion = "1.1.2"
+var pluginVersion = "1.2.0"
 
 // Variable only so the C-shared integration test can inject a local fixture.
 var usageEndpoint = defaultUsageEndpoint

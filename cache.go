@@ -21,6 +21,10 @@ type quotaSample struct {
 	RefusedAt         time.Time
 	LastAttemptAt     time.Time
 	LastErrorCategory string
+	// BackoffUntil holds usage reads for an account the endpoint rate-limited;
+	// RateLimits counts consecutive 429s to grow the backoff.
+	BackoffUntil time.Time
+	RateLimits   int
 }
 
 // used returns a window's percent used, reading 0 once the window has reset:
@@ -103,7 +107,28 @@ func (c *quotaCache) recordPoll(authID string, result usageResult, at time.Time)
 		s.FiveHour, s.Weekly = result.FiveHour, result.Weekly
 		s.PolledAt = at
 		s.LastErrorCategory = ""
+		s.BackoffUntil, s.RateLimits = time.Time{}, 0
 	})
+}
+
+// recordRateLimit backs an account off the usage endpoint: the server's
+// Retry-After when given, else the poll interval doubled per consecutive 429,
+// capped at maxRateLimitBackoff.
+func (c *quotaCache) recordRateLimit(authID string, retryAfter, pollInterval time.Duration, at time.Time) time.Duration {
+	var wait time.Duration
+	c.update(authID, func(s *quotaSample) {
+		s.RateLimits++
+		wait = retryAfter
+		if wait <= 0 {
+			wait = pollInterval
+			for i := 1; i < s.RateLimits && wait < maxRateLimitBackoff; i++ {
+				wait *= 2
+			}
+		}
+		wait = min(wait, maxRateLimitBackoff)
+		s.BackoffUntil = at.Add(wait)
+	})
+	return wait
 }
 
 // recordHeaders applies the windows a proxied response reported. A sample

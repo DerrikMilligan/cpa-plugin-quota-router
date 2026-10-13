@@ -190,11 +190,12 @@ func (r *pluginRuntime) refreshAll(ctx context.Context, onDemand bool) {
 		if ctx.Err() != nil {
 			return
 		}
-		if onDemand {
-			sample, _ := r.cache.snapshot(auth.ID)
-			if r.now().Sub(sample.LastAttemptAt) < minimumRefreshGap {
-				continue
-			}
+		sample, _ := r.cache.snapshot(auth.ID)
+		if r.now().Before(sample.BackoffUntil) {
+			continue
+		}
+		if onDemand && r.now().Sub(sample.LastAttemptAt) < minimumRefreshGap {
+			continue
 		}
 		r.pollAuth(ctx, auth, cfg)
 	}
@@ -218,6 +219,15 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 		return
 	}
 	result, category := r.fetch(ctx, token, cfg.RequestTimeout)
+	if category == pollErrorRateLimited {
+		wait := r.cache.recordRateLimit(auth.ID, result.RetryAfter, cfg.PollInterval, r.now())
+		r.cache.recordFailure(auth.ID, category)
+		r.log("warn", "quota balancer usage read rate-limited; backing off", map[string]any{
+			"auth_id": auth.ID,
+			"backoff": wait.String(),
+		})
+		return
+	}
 	if category != "" {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			category = pollErrorTimeout

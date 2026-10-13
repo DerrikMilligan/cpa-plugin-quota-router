@@ -472,7 +472,7 @@ func TestOnDemandRefreshDoesNotHammerAnUnreadableAccount(t *testing.T) {
 	calls := 0
 	fetch := func(context.Context, string, time.Duration) (usageResult, string) {
 		calls++
-		return usageResult{}, pollErrorRateLimited
+		return usageResult{}, pollErrorServer
 	}
 	c := &clock{now: testNow}
 	r := newPluginRuntime(host, fetch, c.Now)
@@ -541,5 +541,65 @@ func TestStatusMarksOverriddenAccounts(t *testing.T) {
 		if want := account.Email == "a@x.com"; account.Override != want {
 			t.Errorf("%s override = %v, want %v", account.Email, account.Override, want)
 		}
+	}
+}
+
+func TestRateLimitedAccountsBackOff(t *testing.T) {
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{{
+		ID: authIDFor("a@x.com"), AuthIndex: "1", Provider: "claude", Path: "/auth/a", Email: "a@x.com",
+	}}}
+	calls, limited := 0, true
+	fetch := func(context.Context, string, time.Duration) (usageResult, string) {
+		calls++
+		if limited {
+			return usageResult{}, pollErrorRateLimited
+		}
+		return usageResult{Weekly: windowReading{Used: 10}}, ""
+	}
+	c := &clock{now: testNow}
+	r := newPluginRuntime(host, fetch, c.Now)
+	cfg := defaultPluginConfig()
+	r.config.Store(&cfg)
+	poll := func(onDemand bool) { r.refreshAll(context.Background(), onDemand) }
+
+	poll(false) // 429: back off one poll interval
+	c.advance(time.Minute)
+	poll(false)
+	poll(true)
+	if calls != 1 {
+		t.Fatalf("polled %d times inside the backoff, want 1", calls)
+	}
+	c.advance(time.Minute + time.Second) // past 2m
+	poll(false)                          // second 429: back off 4m
+	c.advance(3 * time.Minute)
+	poll(false)
+	if calls != 2 {
+		t.Fatalf("backoff did not double: calls=%d", calls)
+	}
+	if view := r.status().Accounts[0]; view.BackoffUntil == "" {
+		t.Fatalf("status should report the backoff: %#v", view)
+	}
+	c.advance(2 * time.Minute)
+	limited = false
+	poll(false)
+	if sample, _ := r.cache.snapshot(authIDFor("a@x.com")); !sample.HasSample || !sample.BackoffUntil.IsZero() || sample.RateLimits != 0 {
+		t.Fatalf("a successful read should clear the backoff: %#v", sample)
+	}
+}
+
+func TestRateLimitBackoffHonoursRetryAfterAndCaps(t *testing.T) {
+	var q quotaCache
+	q.samples = map[string]quotaSample{}
+	if got := q.recordRateLimit("a", 90*time.Second, 2*time.Minute, testNow); got != 90*time.Second {
+		t.Fatalf("Retry-After ignored: %v", got)
+	}
+	for i := 0; i < 10; i++ {
+		q.recordRateLimit("b", 0, 2*time.Minute, testNow)
+	}
+	if got := q.recordRateLimit("b", 0, 2*time.Minute, testNow); got != maxRateLimitBackoff {
+		t.Fatalf("backoff not capped: %v", got)
+	}
+	if got := parseRetryAfter("120", testNow); got != 2*time.Minute {
+		t.Fatalf("parseRetryAfter seconds = %v", got)
 	}
 }

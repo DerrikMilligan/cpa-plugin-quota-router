@@ -41,7 +41,7 @@
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
   .pill.ok { background: var(--pill-ok); color: var(--pill-ok-text); }
   .pill.bad { background: var(--pill-bad); color: var(--pill-bad-text); }
-  .bar { position: relative; width: 140px; height: 10px; border-radius: 5px; background: var(--track); }
+  .bar { position: relative; width: 110px; height: 10px; border-radius: 5px; background: var(--track); }
   .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; }
   .ceil { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); opacity: .7; }
   .barline { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
@@ -230,7 +230,8 @@
       el("td", {},
         el("div", { class: "acct" }, account.email || account.id,
           account.override ? el("span", { class: "tag", title: "Ceilings set for this account" }, "custom") : null),
-        el("div", { class: "sub" }, ago(account.seen_at), account.last_error ? " - " + account.last_error : "")),
+        el("div", { class: "sub" }, ago(account.seen_at), account.last_error ? " - " + account.last_error : "",
+          account.backoff_until ? " - next read " + new Date(account.backoff_until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "")),
       el("td", { class: "status" }, status, account.eligible ? null : el("div", { class: "sub" }, account.reason || "")),
       el("td", {}, bar(account.five_hour_used, account.ceilings.five_hour, account.five_hour_reset_at, known)),
       el("td", {}, bar(account.weekly_used, account.ceilings.weekly, account.weekly_reset_at, known)),

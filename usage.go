@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,6 +21,8 @@ type windowReading struct {
 type usageResult struct {
 	FiveHour windowReading
 	Weekly   windowReading
+	// RetryAfter is the server's requested wait on a 429, when it sent one.
+	RetryAfter time.Duration
 }
 
 type usageFetcher func(context.Context, string, time.Duration) (usageResult, string)
@@ -86,7 +89,7 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 		case http.StatusForbidden:
 			return usageResult{}, pollErrorForbidden
 		case http.StatusTooManyRequests:
-			return usageResult{}, pollErrorRateLimited
+			return usageResult{RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())}, pollErrorRateLimited
 		default:
 			if resp.StatusCode >= 500 {
 				return usageResult{}, pollErrorServer
@@ -145,6 +148,21 @@ func parseWindow(window *usageWindow) (windowReading, bool) {
 		resetAt = time.Time{}
 	}
 	return windowReading{Used: used, ResetAt: resetAt}, true
+}
+
+// parseRetryAfter reads delay-seconds or an HTTP date; 0 when absent or invalid.
+func parseRetryAfter(raw string, now time.Time) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(raw); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
 }
 
 // Anthropic reports percentage points: 1.0 means 1%, not 100%.
