@@ -12,14 +12,21 @@ per-account ceilings.
 
 ## How it picks
 
-Each account's **headroom** is the smaller of its two windows' points left
-under the ceiling:
+Each account's **headroom** blends its weekly and 5-hour room, weighting weekly
+room by how soon it expires:
 
-    headroom = min(5h ceiling - 5h used, weekly ceiling - weekly used)
+    room          = ceiling - used   (never below 0)
+    reset urgency = (7 days / days until the weekly reset) ^ reset-weight,
+                    days held between 1 and 7
+    headroom      = weekly room x reset urgency + five-hour-weight x 5-hour room
 
-An account with 50% weekly left scores 40 at a 90% ceiling; one with 80% left
-scores 70 and takes the traffic. Feeding the account with the most room pulls
-every account toward the same remaining usage.
+The weekly window is the budget; the 5-hour window is mostly a rate limit that
+recovers within hours, so by default it counts a quarter (`five-hour-weight:
+0.25`). Urgency makes weekly room that is about to expire count up to 7 times
+(`reset-weight: 1`; 0 ignores reset time), so accounts tend to reach their
+weekly ceilings together instead of some resetting with budget unused. Both
+ceilings stay hard limits whatever the weights. The Management Center page
+shows the formula and, on hover, each account's calculation.
 
 - **Ceilings are hard.** An account at or above either ceiling, refused
   upstream, or without a reading newer than `max-staleness` takes no request.
@@ -69,6 +76,8 @@ plugins:
         example@example.com:     # matches no account; a template to copy
           five-hour-ceiling: 90  # unset fields inherit the defaults
           weekly-ceiling: 90
+      five-hour-weight: 0.25     # how much 5-hour room counts in headroom
+      reset-weight: 1            # how strongly a near weekly reset raises headroom
       spread-band: 10            # headroom points treated as a tie
       rebalance-margin: 25       # headroom gap that moves a live conversation
       probe-unread: true         # unreadable accounts take one conversation per 5m

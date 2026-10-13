@@ -12,6 +12,9 @@ const (
 	defaultAffinityTTL         = time.Hour
 	defaultSpreadBand          = 10.0
 	defaultRebalanceMargin     = 25.0
+	defaultFiveHourWeight      = 0.25
+	defaultResetWeight         = 1.0
+	weeklyWindow               = 7 * 24 * time.Hour
 	defaultMaxSessions         = 65536
 	minimumPollInterval        = 30 * time.Second
 	maxRateLimitBackoff        = 15 * time.Minute
@@ -44,7 +47,7 @@ const (
 	pollErrorRead              = "read_error"
 )
 
-var pluginVersion = "1.5.2"
+var pluginVersion = "1.6.0"
 
 // Variables only so tests can inject local fixtures.
 var (

@@ -43,7 +43,18 @@
   .who { min-width: 0; flex: 1; }
   .acct { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sub { color: var(--muted); font-size: 12px; }
-  .headroom { text-align: right; line-height: 1.1; }
+  .headroom { text-align: right; line-height: 1.1; position: relative; cursor: help; border-radius: 6px; outline: none; }
+  .headroom:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+  .tip { display: none; position: absolute; right: 0; top: calc(100% + 8px); z-index: 5; width: 320px;
+         text-align: left; line-height: 1.5; background: var(--panel); color: var(--text);
+         border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: 12px;
+         box-shadow: 0 12px 30px rgba(0,0,0,.3); }
+  .headroom:hover .tip, .headroom:focus .tip { display: block; }
+  .tip .f { color: var(--muted); margin-bottom: 6px; }
+  .tip .row { display: flex; justify-content: space-between; gap: 10px; font-variant-numeric: tabular-nums; }
+  .tip .row b { font-weight: 600; }
+  .tip .total { border-top: 1px solid var(--line); margin-top: 6px; padding-top: 6px; font-weight: 700; }
+  .tip .held { color: var(--pill-bad-text); margin-top: 6px; }
   .headroom .v { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .headroom .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
   .pills { display: flex; gap: 6px; align-items: center; margin-top: 4px; flex-wrap: wrap; }
@@ -140,8 +151,11 @@
   </div>
 </dialog>
 <p class="help">
-  Headroom is the smaller of the two windows' points left under the ceiling; new conversations go to the
-  account with the most. The dark tick on each bar is the ceiling. Blank ceiling inputs use the defaults.
+  Headroom is weekly room times reset urgency, plus the 5-hour room scaled by five-hour-weight. A window's
+  room is its ceiling minus its usage; urgency grows as the weekly reset nears, so weekly room that is about
+  to expire is used first. New conversations go to the account with the most headroom. Both ceilings are
+  hard limits. Hover a headroom number to see its calculation. The dark tick on
+  each bar is the ceiling. Blank ceiling inputs use the defaults.
   Saving updates that account in the plugin config and applies at once.
 </p>
 <script>
@@ -158,6 +172,8 @@
   let key = "";
   let timer = null;
   let editing = false; // a modal is open; auto-refresh waits
+  let weight = 0.25;      // five-hour-weight from the last status
+  let resetWeight = 1;    // reset-weight from the last status
 
   // Theme: follow the Management Center when it saved one, else the OS.
   try {
@@ -210,7 +226,7 @@
     const node = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
       if (k === "class") node.className = v;
-      else if (k === "style") node.setAttribute("style", v);
+      else if (k === "style" || k === "role" || k.includes("-")) node.setAttribute(k, v);
       else node[k] = v;
     }
     for (const child of children) {
@@ -420,9 +436,10 @@
             el("span", { class: "pill plain", title: "Conversations bound to this account" },
               account.live_sessions + " live"),
             account.override ? el("span", { class: "tag", title: "Ceilings set for this account" }, "custom") : null)),
-        el("div", { class: "headroom" },
+        el("div", { class: "headroom", tabIndex: 0, "aria-label": "Headroom calculation" },
           el("div", { class: "v" }, known ? Math.max(0, Math.round(account.headroom)) : "-"),
-          el("div", { class: "k" }, "headroom"))),
+          el("div", { class: "k" }, "headroom"),
+          headroomTip(account))),
       account.eligible ? null : el("div", { class: "reason" }, decode(account.reason || "")),
       windowBar("5-hour", account.five_hour_used, account.ceilings.five_hour, account.five_hour_reset_at, known),
       windowBar("Weekly", account.weekly_used, account.ceilings.weekly, account.weekly_reset_at, known),
@@ -430,6 +447,37 @@
       el("div", { class: "bottom" },
         el("span", { class: "sub" }, read.join(" - ")),
         edit));
+  }
+
+  // Up to one decimal, without a trailing .0.
+  function fmt(n) {
+    return String(Math.round(n * 10) / 10);
+  }
+
+  function headroomTip(account) {
+    const row = (label, value) => el("div", { class: "row" }, el("span", {}, label), el("b", {}, value));
+    const tip = el("div", { class: "tip", role: "tooltip" },
+      el("div", { class: "f" }, "weekly room \u00d7 reset urgency + " + fmt(weight) + " \u00d7 5-hour room. Room = ceiling \u2212 used; urgency = (7 days \u00f7 days to the weekly reset)^" + fmt(resetWeight) + ", days held between 1 and 7."));
+    if (!account.known) {
+      tip.append(el("div", {}, "No usage reading yet, so there is no headroom to score."));
+      return tip;
+    }
+    const c = account.ceilings;
+    const urgency = account.reset_urgency || 1;
+    const weekly = account.weekly_room * urgency, five = account.five_hour_room * weight;
+    const resetIn = account.weekly_reset_at ? until(account.weekly_reset_at).replace("resets in ", "") : "";
+    tip.append(
+      row("Weekly room", fmt(c.weekly) + " \u2212 " + fmt(account.weekly_used) + " = " + fmt(account.weekly_room)),
+      row("Reset urgency", resetIn ? "reset in " + resetIn + ": \u00d7" + (Math.round(urgency * 100) / 100) : "\u00d71 (reset unknown)"),
+      row("Weekly score", fmt(account.weekly_room) + " \u00d7 " + (Math.round(urgency * 100) / 100) + " = " + fmt(weekly)),
+      row("5-hour room", fmt(c.five_hour) + " \u2212 " + fmt(account.five_hour_used) + " = " + fmt(account.five_hour_room)),
+      row("5-hour score", fmt(account.five_hour_room) + " \u00d7 " + fmt(weight) + " = " + fmt(five)),
+      el("div", { class: "row total" }, el("span", {}, "Headroom"),
+        el("b", {}, fmt(weekly) + " + " + fmt(five) + " = " + fmt(account.headroom))));
+    if (!account.eligible) {
+      tip.append(el("div", { class: "held" }, "Held (" + decode(account.reason || "") + "): takes no new requests whatever its headroom."));
+    }
+    return tip;
   }
 
   function stat(value, label) {
@@ -445,8 +493,10 @@
         (b.eligible - a.eligible) || (b.headroom - a.headroom) || String(a.email).localeCompare(String(b.email)));
       const routing = accounts.filter(a => a.eligible).length;
       const live = accounts.reduce((n, a) => n + (a.live_sessions || 0), 0);
+      weight = status.five_hour_weight;
+      resetWeight = status.reset_weight;
       document.getElementById("summary").replaceChildren(
-        "Defaults ", el("b", {}, d.five_hour + "% 5h"), " / ", el("b", {}, d.weekly + "% weekly"),
+        "Headroom = ", el("b", {}, "weekly room \u00d7 reset urgency + " + fmt(weight) + " \u00d7 5-hour room"), " - defaults ", el("b", {}, d.five_hour + "% 5h"), " / ", el("b", {}, d.weekly + "% weekly"),
         " - models ", el("b", {}, (status.models || []).join(", ")),
         " - spread ", el("b", {}, status.spread_band), " - rebalance ", el("b", {}, status.rebalance_margin),
         " - poll ", el("b", {}, status.poll_interval));

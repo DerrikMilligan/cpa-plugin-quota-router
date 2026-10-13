@@ -29,6 +29,8 @@ type rawPluginConfig struct {
 	FiveHour        *float64               `yaml:"five-hour-ceiling"`
 	Weekly          *float64               `yaml:"weekly-ceiling"`
 	Accounts        map[string]rawCeilings `yaml:"accounts"`
+	FiveHourWeight  *float64               `yaml:"five-hour-weight"`
+	ResetWeight     *float64               `yaml:"reset-weight"`
 	SpreadBand      *float64               `yaml:"spread-band"`
 	RebalanceMargin *float64               `yaml:"rebalance-margin"`
 	ProbeUnread     *bool                  `yaml:"probe-unread"`
@@ -51,6 +53,12 @@ type pluginConfig struct {
 	Models   []string
 	Default  ceilings
 	Accounts map[string]ceilings
+	// FiveHourWeight scales the 5-hour window's room in the headroom score:
+	// headroom = weekly room + FiveHourWeight x 5-hour room.
+	FiveHourWeight float64
+	// ResetWeight is the exponent on weekly reset urgency, (7 days / days
+	// until the weekly reset)^ResetWeight, which scales the weekly room.
+	ResetWeight float64
 	// SpreadBand treats accounts within this many headroom points of the best
 	// as equal and spreads new conversations across them by live load.
 	SpreadBand float64
@@ -73,6 +81,8 @@ func defaultPluginConfig() pluginConfig {
 		Accounts:        map[string]ceilings{},
 		SpreadBand:      defaultSpreadBand,
 		RebalanceMargin: defaultRebalanceMargin,
+		FiveHourWeight:  defaultFiveHourWeight,
+		ResetWeight:     defaultResetWeight,
 		ProbeUnread:     true,
 		AffinityTTL:     defaultAffinityTTL,
 		PollInterval:    defaultPollInterval,
@@ -161,6 +171,18 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 			return pluginConfig{}, err
 		}
 		cfg.Accounts[key] = account
+	}
+	if decoded.FiveHourWeight != nil {
+		cfg.FiveHourWeight = *decoded.FiveHourWeight
+	}
+	if !finite(cfg.FiveHourWeight) || cfg.FiveHourWeight < 0 || cfg.FiveHourWeight > 4 {
+		return pluginConfig{}, fmt.Errorf("five-hour-weight must be between 0 and 4")
+	}
+	if decoded.ResetWeight != nil {
+		cfg.ResetWeight = *decoded.ResetWeight
+	}
+	if !finite(cfg.ResetWeight) || cfg.ResetWeight < 0 || cfg.ResetWeight > 3 {
+		return pluginConfig{}, fmt.Errorf("reset-weight must be between 0 and 3")
 	}
 	if decoded.SpreadBand != nil {
 		cfg.SpreadBand = *decoded.SpreadBand
@@ -302,6 +324,8 @@ func pluginRegistration() registration {
 				{Name: "five-hour-ceiling", Type: pluginapi.ConfigFieldTypeNumber, Description: "Hard limit in percent used on the 5-hour session window. An account at or above it takes no requests until a reading shows it back under. Default: 90."},
 				{Name: "weekly-ceiling", Type: pluginapi.ConfigFieldTypeNumber, Description: "Hard limit in percent used on the weekly window. An account at or above it takes no requests until a reading shows it back under. Default: 90."},
 				{Name: "accounts", Type: pluginapi.ConfigFieldTypeObject, Description: "Per-account ceilings that override the two defaults above, as a JSON object keyed by account email or auth file name. Each value can set five-hour-ceiling and weekly-ceiling in percent; a field left out uses the default. The example@example.com entry matches no account: copy it, change the email and set the numbers. Delete an entry to return that account to the defaults. A lower ceiling also means less traffic, since the account has less headroom."},
+				{Name: "five-hour-weight", Type: pluginapi.ConfigFieldTypeNumber, Description: "How much the 5-hour window counts in headroom: headroom = weekly room x reset urgency + weight x 5-hour room, where room = ceiling - used. 0 ranks by weekly alone; 1 counts both fully. Both ceilings stay hard limits either way. Default: 0.25."},
+				{Name: "reset-weight", Type: pluginapi.ConfigFieldTypeNumber, Description: "How much a near weekly reset raises headroom: reset urgency = (7 days / days until the weekly reset) to this power, with days held between 1 and 7, so weekly room about to expire is used first. 0 ignores reset time. Default: 1."},
 				{Name: "spread-band", Type: pluginapi.ConfigFieldTypeNumber, Description: "Accounts within this many headroom points of the best count as tied, and new conversations spread across them by load. Default: 10."},
 				{Name: "rebalance-margin", Type: pluginapi.ConfigFieldTypeNumber, Description: "A running conversation moves to another account once that account has this many more headroom points than its own. Each move costs one cold prompt cache. Default: 25."},
 				{Name: "probe-unread", Type: pluginapi.ConfigFieldTypeBoolean, Description: "When the usage endpoint cannot read an account, let it take one new conversation every 5 minutes so the response headers report its usage. The account may take that one request above its ceiling before it is held. Default: on."},

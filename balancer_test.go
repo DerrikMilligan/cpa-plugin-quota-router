@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -82,7 +83,8 @@ func newTestRuntime(t *testing.T, cfg pluginConfig, usage map[string][2]float64)
 		}
 		return usageResult{
 			FiveHour: windowReading{Used: used[0], ResetAt: c.Now().Add(3 * time.Hour)},
-			Weekly:   windowReading{Used: used[1], ResetAt: c.Now().Add(72 * time.Hour)},
+			// A full week left, so reset urgency is 1 unless a test sets it.
+			Weekly: windowReading{Used: used[1], ResetAt: c.Now().Add(weeklyWindow)},
 		}, ""
 	}
 	r := newPluginRuntime(host, fetch, c.Now)
@@ -141,13 +143,45 @@ func TestPrefersTheAccountWithTheMostUsageLeft(t *testing.T) {
 	}
 }
 
-func TestFiveHourWindowCountsToo(t *testing.T) {
+func TestWeeklyRoomOutweighsFiveHourRoomByDefault(t *testing.T) {
+	// a: 5h 20 left, weekly 80 left -> 80 + 0.25*20 = 85
+	// b: 5h 80 left, weekly 50 left -> 50 + 0.25*80 = 70
 	r, _ := newTestRuntime(t, defaultPluginConfig(), map[string][2]float64{
-		"a@x.com": {70, 10}, // 5h headroom 20
-		"b@x.com": {10, 40}, // weekly headroom 50
+		"a@x.com": {70, 10},
+		"b@x.com": {10, 40},
 	})
+	if got := mustPick(t, r, "", "a@x.com", "b@x.com"); got != "a@x.com" {
+		t.Fatalf("picked %s; the account with more weekly room should win", got)
+	}
+	view := r.status().Accounts[0]
+	if view.WeeklyRoom != 80 || view.FiveHourRoom != 20 || view.Headroom != 85 {
+		t.Fatalf("a@x.com breakdown = weekly %v, 5h %v, headroom %v", view.WeeklyRoom, view.FiveHourRoom, view.Headroom)
+	}
+}
+
+func TestFiveHourWeightIsConfigurable(t *testing.T) {
+	usage := map[string][2]float64{"a@x.com": {70, 10}, "b@x.com": {10, 40}}
+	equal := defaultPluginConfig()
+	equal.FiveHourWeight = 1 // a: 80+20 = 100, b: 50+80 = 130
+	r, _ := newTestRuntime(t, equal, usage)
 	if got := mustPick(t, r, "", "a@x.com", "b@x.com"); got != "b@x.com" {
-		t.Fatalf("picked %s, want b@x.com", got)
+		t.Fatalf("weight 1 picked %s, want b@x.com", got)
+	}
+	weeklyOnly := defaultPluginConfig()
+	weeklyOnly.FiveHourWeight = 0
+	weeklyOnly.SpreadBand = 0
+	r, _ = newTestRuntime(t, weeklyOnly, map[string][2]float64{"a@x.com": {85, 10}, "b@x.com": {0, 11}})
+	if got := mustPick(t, r, "", "a@x.com", "b@x.com"); got != "a@x.com" {
+		t.Fatalf("weight 0 picked %s; only weekly room should count", got)
+	}
+}
+
+func TestFiveHourCeilingStaysHardWhateverTheWeight(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.FiveHourWeight = 0
+	r, _ := newTestRuntime(t, cfg, map[string][2]float64{"a@x.com": {90, 0}, "b@x.com": {0, 80}})
+	if got := mustPick(t, r, "", "a@x.com", "b@x.com"); got != "b@x.com" {
+		t.Fatalf("picked %s at its 5-hour ceiling", got)
 	}
 }
 
@@ -239,8 +273,8 @@ func TestConversationRebalancesWhenFarBehind(t *testing.T) {
 		"b@x.com": {0, 20},
 	})
 	first := mustPick(t, r, "conv", "a@x.com", "b@x.com")
-	// Its account drops to 30 headroom while the other keeps 70.
-	r.handleUsage(usageRecord{AuthID: authIDFor(first), ResponseHeaders: rateHeaders(0.60, 0.30)})
+	// Its account drops to 45 + 0.25*30 = 52.5 headroom while the other keeps 92.5.
+	r.handleUsage(usageRecord{AuthID: authIDFor(first), ResponseHeaders: rateHeaders(0.60, 0.45)})
 	c.advance(time.Second)
 	if got := mustPick(t, r, "conv", "a@x.com", "b@x.com"); got == first {
 		t.Fatalf("conversation stayed on %s 40 points behind", first)
@@ -373,6 +407,7 @@ accounts:
   Kphair@isolvedhcm.com:
     five-hour-ceiling: 60
 poll-interval: 1s
+five-hour-weight: 0.5
 `)})
 	cfg, err := decodeLifecycleConfig(raw)
 	if err != nil {
@@ -384,10 +419,13 @@ poll-interval: 1s
 	if got := cfg.ceilingsFor("kphair@isolvedhcm.com", "", ""); got != (ceilings{60, 88}) {
 		t.Fatalf("override = %#v, want unset fields to inherit the default", got)
 	}
+	if cfg.FiveHourWeight != 0.5 {
+		t.Fatalf("five-hour-weight = %v", cfg.FiveHourWeight)
+	}
 	if cfg.PollInterval != minimumPollInterval || cfg.MaxStaleness != defaultMaxStaleness {
 		t.Fatalf("poll=%v staleness=%v", cfg.PollInterval, cfg.MaxStaleness)
 	}
-	for _, bad := range []string{"five-hour-ceiling: 0", "weekly-ceiling: 101", "accounts: {a: {weekly-ceiling: -1}}", "spread-band: -1", "poll-interval: soon"} {
+	for _, bad := range []string{"five-hour-ceiling: 0", "weekly-ceiling: 101", "accounts: {a: {weekly-ceiling: -1}}", "spread-band: -1", "poll-interval: soon", "five-hour-weight: -0.1", "five-hour-weight: 5", "reset-weight: 4"} {
 		raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte(bad)})
 		if _, err := decodeLifecycleConfig(raw); err == nil {
 			t.Fatalf("%q should be rejected", bad)
@@ -804,7 +842,7 @@ func probeRuntime(t *testing.T, cfg pluginConfig, unreadableError string) (*plug
 		}
 		return usageResult{
 			FiveHour: windowReading{Used: 10, ResetAt: c.Now().Add(3 * time.Hour)},
-			Weekly:   windowReading{Used: 10, ResetAt: c.Now().Add(72 * time.Hour)},
+			Weekly:   windowReading{Used: 10, ResetAt: c.Now().Add(weeklyWindow)},
 		}, ""
 	}
 	r := newPluginRuntime(host, fetch, c.Now)
@@ -902,5 +940,56 @@ func TestProbeDoesNotStealABoundConversation(t *testing.T) {
 	r.config.Store(&enabled)
 	if got := pickWithStatus(t, r, "conv-1", nil); got != "known@x.com" {
 		t.Fatalf("a probe pulled an existing conversation off its account: %s", got)
+	}
+}
+
+func setWeeklyReset(r *pluginRuntime, email string, in time.Duration) {
+	r.cache.update(authIDFor(email), func(s *quotaSample) { s.Weekly.ResetAt = r.now().Add(in) })
+}
+
+func TestWeeklyRoomNearItsResetIsUsedFirst(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.SpreadBand = 0
+	// soon: 40 weekly room, resets in a day -> 40 x 7 = 280 (+ 0.25 x 90)
+	// later: 60 weekly room, resets in 6 days -> 60 x 7/6 = 70 (+ 0.25 x 90)
+	r, _ := newTestRuntime(t, cfg, map[string][2]float64{"soon@x.com": {0, 50}, "later@x.com": {0, 30}})
+	setWeeklyReset(r, "soon@x.com", 24*time.Hour)
+	setWeeklyReset(r, "later@x.com", 6*24*time.Hour)
+	if got := mustPick(t, r, "", "soon@x.com", "later@x.com"); got != "soon@x.com" {
+		t.Fatalf("picked %s; weekly room about to expire should be used first", got)
+	}
+	for _, a := range r.status().Accounts {
+		if a.Email == "soon@x.com" && (math.Abs(a.ResetUrgency-7) > 1e-9 || math.Abs(a.Headroom-302.5) > 1e-9) {
+			t.Fatalf("soon@x.com urgency %v headroom %v, want 7 and 302.5", a.ResetUrgency, a.Headroom)
+		}
+	}
+
+	off := defaultPluginConfig()
+	off.SpreadBand, off.ResetWeight = 0, 0
+	r, _ = newTestRuntime(t, off, map[string][2]float64{"soon@x.com": {0, 50}, "later@x.com": {0, 30}})
+	setWeeklyReset(r, "soon@x.com", 24*time.Hour)
+	setWeeklyReset(r, "later@x.com", 6*24*time.Hour)
+	if got := mustPick(t, r, "", "soon@x.com", "later@x.com"); got != "later@x.com" {
+		t.Fatalf("reset-weight 0 picked %s; only room should count", got)
+	}
+}
+
+func TestResetUrgencyBounds(t *testing.T) {
+	for _, c := range []struct {
+		in   time.Duration
+		want float64
+	}{{weeklyWindow, 1}, {10 * 24 * time.Hour, 1}, {84 * time.Hour, 2}, {24 * time.Hour, 7}, {time.Hour, 7}} {
+		if got := resetUrgency(testNow.Add(c.in), testNow, 1); math.Abs(got-c.want) > 1e-9 {
+			t.Errorf("reset in %v: urgency %v, want %v", c.in, got, c.want)
+		}
+	}
+	if got := resetUrgency(time.Time{}, testNow, 1); got != 1 {
+		t.Errorf("unknown reset urgency %v", got)
+	}
+	if got := resetUrgency(testNow.Add(-time.Hour), testNow, 1); got != 1 {
+		t.Errorf("passed reset urgency %v", got)
+	}
+	if got := resetUrgency(testNow.Add(24*time.Hour), testNow, 0.5); math.Abs(got-math.Sqrt(7)) > 1e-9 {
+		t.Errorf("weight 0.5 urgency %v", got)
 	}
 }

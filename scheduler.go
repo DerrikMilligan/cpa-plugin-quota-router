@@ -72,8 +72,12 @@ type accountView struct {
 	Refused  bool    `json:"refused,omitempty"`
 	FiveHour float64 `json:"five_hour_used"`
 	Weekly   float64 `json:"weekly_used"`
-	// Headroom is the smaller of the two windows' points left under the ceiling.
+	// Headroom = weekly room x reset urgency + five-hour-weight x 5-hour room,
+	// where a window's room is its ceiling minus its usage (never below 0).
 	Headroom        float64     `json:"headroom"`
+	WeeklyRoom      float64     `json:"weekly_room"`
+	ResetUrgency    float64     `json:"reset_urgency"`
+	FiveHourRoom    float64     `json:"five_hour_room"`
 	Eligible        bool        `json:"eligible"`
 	Reason          string      `json:"reason,omitempty"`
 	LiveSessions    int         `json:"live_sessions"`
@@ -109,7 +113,10 @@ func evaluate(authID string, sample quotaSample, cfg pluginConfig, now time.Time
 	}
 	view.FiveHour = sample.FiveHour.used(now)
 	view.Weekly = sample.Weekly.used(now)
-	view.Headroom = math.Min(view.Ceilings.FiveHour-view.FiveHour, view.Ceilings.Weekly-view.Weekly)
+	view.WeeklyRoom = math.Max(0, view.Ceilings.Weekly-view.Weekly)
+	view.FiveHourRoom = math.Max(0, view.Ceilings.FiveHour-view.FiveHour)
+	view.ResetUrgency = resetUrgency(sample.Weekly.ResetAt, now, cfg.ResetWeight)
+	view.Headroom = view.WeeklyRoom*view.ResetUrgency + cfg.FiveHourWeight*view.FiveHourRoom
 	view.FiveHourResetAt = formatTime(sample.FiveHour.ResetAt)
 	view.WeeklyResetAt = formatTime(sample.Weekly.ResetAt)
 	view.SeenAt = formatTime(sample.seenAt())
@@ -126,6 +133,18 @@ func evaluate(authID string, sample quotaSample, cfg pluginConfig, now time.Time
 		view.Eligible = true
 	}
 	return view
+}
+
+// resetUrgency scales weekly room by how soon it expires: (7 days / days
+// until the weekly reset)^weight, with days held between 1 and 7, so a full
+// week left counts once and a day or less counts up to 7 times. An unknown
+// or passed reset counts once.
+func resetUrgency(resetAt, now time.Time, weight float64) float64 {
+	if weight == 0 || resetAt.IsZero() || !now.Before(resetAt) {
+		return 1
+	}
+	left := min(max(resetAt.Sub(now), 24*time.Hour), weeklyWindow)
+	return math.Pow(float64(weeklyWindow)/float64(left), weight)
 }
 
 func formatTime(t time.Time) string {
@@ -318,6 +337,8 @@ type statusResponse struct {
 	Models          []string            `json:"models"`
 	Default         ceilings            `json:"default_ceilings"`
 	Overrides       map[string]ceilings `json:"account_ceilings,omitempty"`
+	FiveHourWeight  float64             `json:"five_hour_weight"`
+	ResetWeight     float64             `json:"reset_weight"`
 	SpreadBand      float64             `json:"spread_band"`
 	RebalanceMargin float64             `json:"rebalance_margin"`
 	PollInterval    string              `json:"poll_interval"`
@@ -345,6 +366,8 @@ func (r *pluginRuntime) status() statusResponse {
 		Models:          models,
 		Default:         cfg.Default,
 		Overrides:       cfg.Accounts,
+		FiveHourWeight:  cfg.FiveHourWeight,
+		ResetWeight:     cfg.ResetWeight,
 		SpreadBand:      cfg.SpreadBand,
 		RebalanceMargin: cfg.RebalanceMargin,
 		PollInterval:    cfg.PollInterval.String(),
